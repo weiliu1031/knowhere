@@ -65,6 +65,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                   std::is_same_v<data_t, knowhere::fp16> || std::is_same_v<data_t, knowhere::bf16>);
 
  public:
+    bool base_layer_only = {false};
+    int num_seeds = 32;
     static const tableint max_update_element_locks = 65536;
 
     static constexpr bool sq_enabled = quant_type != QuantType::None && knowhere::KnowhereFloatTypeCheck<data_t>::value;
@@ -1335,38 +1337,49 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if ((param && param->for_tuning) || !lru_cache.try_get(vec_hash, currObj)) {
             dist_t curdist = calcDistance(query_data, enterpoint_node_);
 
-            for (int level = maxlevel_; level > 0; level--) {
-                bool changed = true;
-                if (feder_result != nullptr) {
-                    feder_result->visit_info_.AddLevelVisitRecord(level);
-                }
-                while (changed) {
-                    changed = false;
-                    unsigned int* data;
-
-                    data = (unsigned int*)get_linklist(currObj, level);
-                    int size = getListCount(data);
-                    metric_hops++;
-                    metric_distance_computations += size;
-                    tableint* datal = (tableint*)(data + 1);
-                    for (int i = 0; i < size; ++i) {
-                        prefetchData(datal[i]);
+            if (base_layer_only) {
+                for (int i = 0; i < num_seeds; i++) {
+                    tableint obj = i * (max_elements_ / num_seeds);
+                    dist_t dist = fstdistfunc_(query_data, getDataByInternalId(obj), dist_func_param_);
+                    if (dist < curdist) {
+                        curdist = dist;
+                        currObj = obj;
                     }
-                    for (int i = 0; i < size; i++) {
-                        tableint cand = datal[i];
-                        if (cand < 0 || cand > max_elements_)
-                            throw std::runtime_error("cand error");
-                        dist_t d = calcDistance(query_data, cand);
-                        if (feder_result != nullptr) {
-                            feder_result->visit_info_.AddVisitRecord(level, currObj, cand, d);
-                            feder_result->id_set_.insert(currObj);
-                            feder_result->id_set_.insert(cand);
-                        }
+                }
+            } else {
+                for (int level = maxlevel_; level > 0; level--) {
+                    bool changed = true;
+                    if (feder_result != nullptr) {
+                        feder_result->visit_info_.AddLevelVisitRecord(level);
+                    }
+                    while (changed) {
+                        changed = false;
+                        unsigned int* data;
 
-                        if (d < curdist) {
-                            curdist = d;
-                            currObj = cand;
-                            changed = true;
+                        data = (unsigned int*)get_linklist(currObj, level);
+                        int size = getListCount(data);
+                        metric_hops++;
+                        metric_distance_computations += size;
+                        tableint* datal = (tableint*)(data + 1);
+                        for (int i = 0; i < size; ++i) {
+                            prefetchData(datal[i]);
+                        }
+                        for (int i = 0; i < size; i++) {
+                            tableint cand = datal[i];
+                            if (cand < 0 || cand > max_elements_)
+                                throw std::runtime_error("cand error");
+                            dist_t d = calcDistance(query_data, cand);
+                            if (feder_result != nullptr) {
+                                feder_result->visit_info_.AddVisitRecord(level, currObj, cand, d);
+                                feder_result->id_set_.insert(currObj);
+                                feder_result->id_set_.insert(cand);
+                            }
+
+                            if (d < curdist) {
+                                curdist = d;
+                                currObj = cand;
+                                changed = true;
+                            }
                         }
                     }
                 }
@@ -1392,7 +1405,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         std::unique_ptr<int8_t[]> query_data_sq;
-        const data_t* raw_data = (const data_t*)query_data;
+        [[maybe_unused]] const data_t* raw_data = (const data_t*)query_data;
         if constexpr (sq_enabled) {
             query_data_sq = std::make_unique<int8_t[]>(*(size_t*)dist_func_param_);
             encodeSQuant((const data_t*)query_data, query_data_sq.get());
@@ -1451,7 +1464,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     };
 
     std::unique_ptr<IteratorWorkspace>
-    getIteratorWorkspace(const void* query_data, const size_t seed_ef, const bool for_tuning,
+    getIteratorWorkspace(const void* query_data, const size_t ef, const bool for_tuning,
                          const knowhere::BitsetView& bitset) const {
         auto accumulative_alpha = (bitset.count() >= (cur_element_count * kHnswSearchKnnBFFilterThreshold))
                                       ? std::numeric_limits<float>::max()
@@ -1471,7 +1484,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             encodeSQuant((data_t*)query_data_copy.get(), query_data_sq.get());
         }
 
-        return std::make_unique<IteratorWorkspace>(std::move(query_data_sq), max_elements_, seed_ef, for_tuning,
+        return std::make_unique<IteratorWorkspace>(std::move(query_data_sq), max_elements_, ef, for_tuning,
                                                    std::move(query_data_copy), bitset, accumulative_alpha);
     }
 
@@ -1489,11 +1502,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             tableint currObj = searchTopLayers(query_data, workspace->param.get()).first;
             NeighborSetDoublePopList retset;
             if (has_deletions) {
-                retset = searchBaseLayerST<true, true>(currObj, query_data, workspace->seed_ef, workspace->visited,
+                retset = searchBaseLayerST<true, true>(currObj, query_data, workspace->ef, workspace->visited,
                                                        workspace->bitset, feder_result, &workspace->to_visit,
                                                        workspace->accumulative_alpha);
             } else {
-                retset = searchBaseLayerST<false, true>(currObj, query_data, workspace->seed_ef, workspace->visited,
+                retset = searchBaseLayerST<false, true>(currObj, query_data, workspace->ef, workspace->visited,
                                                         workspace->bitset, feder_result, &workspace->to_visit,
                                                         workspace->accumulative_alpha);
             }

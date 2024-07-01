@@ -12,25 +12,25 @@ spec:
     - key: node-role.kubernetes.io/knowhere
       operator: Equal
       effect: NoSchedule
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector:
-            matchExpressions:
-            - key: app
-              operator: In
-              values:
-              - knowhere-e2e
-          topologyKey: "kubernetes.io/hostname"
+  # affinity:
+  #   podAntiAffinity:
+  #     requiredDuringSchedulingIgnoredDuringExecution:
+  #       - labelSelector:
+  #           matchExpressions:
+  #           - key: app
+  #             operator: In
+  #             values:
+  #             - knowhere-e2e
+  #         topologyKey: "kubernetes.io/hostname"
   containers:
   - name: main
-    image: milvusdb/knowhere-cpu-build:amd64-ubuntu20.04-20240229-c96b383
+    image: milvusdb/knowhere-cpu-build:amd64-ubuntu22.04-20240528-ccc71670
     tty: true
     args: ["cat"]
     resources:
       requests:
-        memory: "30Gi"
-        cpu: "8"
+        memory: "16Gi"
+        cpu: "4"
       limits:
         memory: "30Gi"
         cpu: "8"
