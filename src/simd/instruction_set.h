@@ -12,8 +12,6 @@
 #ifndef INSTRUCTION_SET_H
 #define INSTRUCTION_SET_H
 
-#include <cpuid.h>
-
 #include <array>
 #include <bitset>
 #include <cstring>
@@ -21,7 +19,13 @@
 #include <string>
 #include <vector>
 
+// faiss::cppcontrib::knowhere::InstructionSet is x86-specific and uses cpuid instructions
+#if defined(__x86_64__) || defined(_M_X64)
+#include <cpuid.h>
+
 namespace faiss {
+namespace cppcontrib {
+namespace knowhere {
 
 class InstructionSet {
  public:
@@ -347,6 +351,11 @@ class InstructionSet {
         return isAMD_ && f_81_EDX_[31];
     }
 
+    bool
+    AVX512VPOPCNTDQ() {
+        return f_7_ECX_[14];
+    }
+
  private:
     int nIds_;
     int nExIds_;
@@ -364,6 +373,9 @@ class InstructionSet {
     std::vector<std::array<int, 4>> extdata_;
 };
 
+}  // namespace knowhere
+}  // namespace cppcontrib
 }  // namespace faiss
+#endif  // __x86_64__ || _M_X64
 
 #endif /* INSTRUCTION_SET_H */

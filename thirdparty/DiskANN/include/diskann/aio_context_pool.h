@@ -8,10 +8,38 @@
 #include "concurrent_queue.h"
 #include "aux_utils.h"
 #include "diskann/ann_exception.h"
+#include "diskann/defaults.h"
+#include <iostream>
+#include <fstream>
+#include <string>
 
 constexpr size_t default_max_nr = 65536;
-constexpr size_t default_max_events = diskann::MAX_N_SECTOR_READS / 2;
+constexpr size_t default_max_events = diskann::defaults::MAX_N_SECTOR_READS / 2;
 constexpr size_t default_pool_size = default_max_nr / default_max_events;
+
+struct AioInfo {
+    long aio_nr = 0;
+    long aio_max_nr = 0;
+};
+
+static AioInfo readAioInfo() {
+    AioInfo info{0, 0};
+
+    std::ifstream nrFile("/proc/sys/fs/aio-nr");
+    std::ifstream maxFile("/proc/sys/fs/aio-max-nr");
+
+    if (!nrFile.is_open()) {
+        throw std::runtime_error("Failed to open /proc/sys/fs/aio-nr");
+    }
+    if (!maxFile.is_open()) {
+        throw std::runtime_error("Failed to open /proc/sys/fs/aio-max-nr");
+    }
+
+    nrFile >> info.aio_nr;
+    maxFile >> info.aio_max_nr;
+
+    return info;
+}
 
 class AioContextPool {
  public:
@@ -40,7 +68,7 @@ class AioContextPool {
     if (stop_) {
       return nullptr;
     }
-    ctx_cv_.wait(lk, [this] { return ctx_q_.size(); });
+    ctx_cv_.wait(lk, [this] { return stop_ || ctx_q_.size(); });
     if (stop_) {
       return nullptr;
     }
@@ -90,7 +118,10 @@ class AioContextPool {
   }
 
   ~AioContextPool() {
-    stop_ = true;
+    {
+      std::scoped_lock lk(ctx_mtx_);
+      stop_ = true;
+    }
     for (auto ctx : ctx_bak_) {
       io_destroy(ctx);
     }
@@ -111,6 +142,13 @@ class AioContextPool {
 
   AioContextPool(size_t num_ctx, size_t max_events)
       : num_ctx_(num_ctx), max_events_(max_events) {
+	AioInfo aio_info = readAioInfo();
+	size_t available_aio = (size_t)(aio_info.aio_max_nr - aio_info.aio_nr);
+	if(num_ctx * max_events > available_aio) {
+		LOG_KNOWHERE_INFO_ << " max events requested is too high: " << max_events << " setting to: " << available_aio / num_ctx;
+	  max_events_ = available_aio / num_ctx;
+		max_events = max_events_;
+	}
     for (size_t i = 0; i < num_ctx_; ++i) {
       io_context_t ctx = 0;
       int          ret = -1;
@@ -125,10 +163,17 @@ class AioContextPool {
         LOG(ERROR) << "io_setup() failed; returned " << ret
                    << ", errno=" << -ret << ":" << ::strerror(-ret);
       } else {
-        LOG_KNOWHERE_DEBUG_ << "allocating ctx: " << ctx;
+        LOG_KNOWHERE_DEBUG_ << "allocating ctx: " << ctx << " with max_events " << max_events_;
         ctx_q_.push(ctx);
         ctx_bak_.push_back(ctx);
       }
+    }
+    if (ctx_q_.empty()) {
+      std::stringstream err;
+      err << "AioContextPool: all " << num_ctx_
+          << " io_setup() calls failed; unable to allocate any AIO context "
+             "(check fs.aio-max-nr / fs.aio-nr for available headroom)";
+      throw diskann::ANNException(err.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
     }
   }
 };

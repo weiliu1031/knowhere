@@ -19,12 +19,12 @@
 #include <list>
 #include <optional>
 #include <sstream>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
 
+#include "knowhere/comp/index_param.h"
 #include "knowhere/comp/materialized_view.h"
 #include "knowhere/expected.h"
 #include "knowhere/log.h"
@@ -38,6 +38,10 @@ typedef nlohmann::json Json;
 #define CFG_INT std::optional<int32_t>
 #endif
 
+#ifndef CFG_INT64
+#define CFG_INT64 std::optional<int64_t>
+#endif
+
 #ifndef CFG_STRING
 #define CFG_STRING std::optional<std::string>
 #endif
@@ -46,21 +50,39 @@ typedef nlohmann::json Json;
 #define CFG_FLOAT std::optional<float>
 #endif
 
-#ifndef CFG_LIST
-#define CFG_LIST std::optional<std::list<int>>
-#endif
-
 #ifndef CFG_BOOL
 #define CFG_BOOL std::optional<bool>
 #endif
 
 #ifndef CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE
-#define CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE std::optional<MaterializedViewSearchInfo>
+#define CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE std::optional<knowhere::MaterializedViewSearchInfo>
 #endif
 
-#ifndef CFG_BYTES
-#define CFG_BYTES std::optional<std::vector<uint8_t>>
-#endif
+template <typename T>
+struct Range {
+    T left;
+    T right;
+    bool include_left;
+    bool include_right;
+
+    Range(T left, T right, bool includeLeft, bool includeRight)
+        : left(left), right(right), include_left(includeLeft), include_right(includeRight) {
+    }
+
+    bool
+    within(T val) {
+        bool left_range_check = left < val || (include_left && left <= val);
+        bool right_range_check = val < right || (include_right && val <= right);
+        return left_range_check && right_range_check;
+    }
+
+    std::string
+    to_string() {
+        std::string left_mark = include_left ? "[" : "(";
+        std::string right_mark = include_right ? "]" : ")";
+        return left_mark + std::to_string(left) + ", " + std::to_string(right) + right_mark;
+    }
+};
 
 template <typename T>
 struct Entry {};
@@ -74,17 +96,18 @@ enum PARAM_TYPE {
     DESERIALIZE_FROM_FILE = 1 << 5,
     ITERATOR = 1 << 6,
     CLUSTER = 1 << 7,
+    STATIC = 1 << 8,
 };
 
 template <>
 struct Entry<CFG_STRING> {
-    explicit Entry<CFG_STRING>(CFG_STRING* v) {
+    explicit Entry(CFG_STRING* v) {
         val = v;
         type = 0x0;
         default_val = std::nullopt;
         desc = std::nullopt;
     }
-    Entry<CFG_STRING>() {
+    Entry() {
         val = nullptr;
         type = 0x0;
         default_val = std::nullopt;
@@ -99,14 +122,14 @@ struct Entry<CFG_STRING> {
 
 template <>
 struct Entry<CFG_FLOAT> {
-    explicit Entry<CFG_FLOAT>(CFG_FLOAT* v) {
+    explicit Entry(CFG_FLOAT* v) {
         val = v;
         default_val = std::nullopt;
         type = 0x0;
         range = std::nullopt;
         desc = std::nullopt;
     }
-    Entry<CFG_FLOAT>() {
+    Entry() {
         val = nullptr;
         default_val = std::nullopt;
         type = 0x0;
@@ -117,21 +140,21 @@ struct Entry<CFG_FLOAT> {
     CFG_FLOAT* val;
     std::optional<CFG_FLOAT::value_type> default_val;
     uint32_t type;
-    std::optional<std::pair<CFG_FLOAT::value_type, CFG_FLOAT::value_type>> range;
+    std::optional<Range<CFG_FLOAT::value_type>> range;
     std::optional<std::string> desc;
     bool allow_empty_without_default = false;
 };
 
 template <>
 struct Entry<CFG_INT> {
-    explicit Entry<CFG_INT>(CFG_INT* v) {
+    explicit Entry(CFG_INT* v) {
         val = v;
         default_val = std::nullopt;
         type = 0x0;
         range = std::nullopt;
         desc = std::nullopt;
     }
-    Entry<CFG_INT>() {
+    Entry() {
         val = nullptr;
         default_val = std::nullopt;
         type = 0x0;
@@ -142,44 +165,46 @@ struct Entry<CFG_INT> {
     CFG_INT* val;
     std::optional<CFG_INT::value_type> default_val;
     uint32_t type;
-    std::optional<std::pair<CFG_INT::value_type, CFG_INT::value_type>> range;
+    std::optional<Range<CFG_INT::value_type>> range;
     std::optional<std::string> desc;
     bool allow_empty_without_default = false;
 };
 
 template <>
-struct Entry<CFG_LIST> {
-    explicit Entry<CFG_LIST>(CFG_LIST* v) {
+struct Entry<CFG_INT64> {
+    explicit Entry(CFG_INT64* v) {
         val = v;
         default_val = std::nullopt;
         type = 0x0;
+        range = std::nullopt;
         desc = std::nullopt;
     }
-
-    Entry<CFG_LIST>() {
+    Entry() {
         val = nullptr;
         default_val = std::nullopt;
         type = 0x0;
+        range = std::nullopt;
         desc = std::nullopt;
     }
 
-    CFG_LIST* val;
-    std::optional<CFG_LIST::value_type> default_val;
+    CFG_INT64* val;
+    std::optional<CFG_INT64::value_type> default_val;
     uint32_t type;
+    std::optional<Range<CFG_INT64::value_type>> range;
     std::optional<std::string> desc;
     bool allow_empty_without_default = false;
 };
 
 template <>
 struct Entry<CFG_BOOL> {
-    explicit Entry<CFG_BOOL>(CFG_BOOL* v) {
+    explicit Entry(CFG_BOOL* v) {
         val = v;
         default_val = std::nullopt;
         type = 0x0;
         desc = std::nullopt;
     }
 
-    Entry<CFG_BOOL>() {
+    Entry() {
         val = nullptr;
         default_val = std::nullopt;
         type = 0x0;
@@ -195,14 +220,14 @@ struct Entry<CFG_BOOL> {
 
 template <>
 struct Entry<CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE> {
-    explicit Entry<CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE>(CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE* v) {
+    explicit Entry(CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE* v) {
         val = v;
         default_val = std::nullopt;
         type = 0x0;
         desc = std::nullopt;
     }
 
-    Entry<CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE>() {
+    Entry() {
         val = nullptr;
         default_val = std::nullopt;
         type = 0x0;
@@ -211,29 +236,6 @@ struct Entry<CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE> {
 
     CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE* val;
     std::optional<CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE::value_type> default_val;
-    uint32_t type;
-    std::optional<std::string> desc;
-    bool allow_empty_without_default = false;
-};
-
-template <>
-struct Entry<CFG_BYTES> {
-    explicit Entry<CFG_BYTES>(CFG_BYTES* v) {
-        val = v;
-        default_val = std::nullopt;
-        type = 0x0;
-        desc = std::nullopt;
-    }
-
-    Entry<CFG_BYTES>() {
-        val = nullptr;
-        default_val = std::nullopt;
-        type = 0x0;
-        desc = std::nullopt;
-    }
-
-    CFG_BYTES* val;
-    std::optional<CFG_BYTES::value_type> default_val;
     uint32_t type;
     std::optional<std::string> desc;
     bool allow_empty_without_default = false;
@@ -252,8 +254,8 @@ class EntryAccess {
     }
 
     EntryAccess&
-    set_range(typename T::value_type a, typename T::value_type b) {
-        entry->range = std::make_pair(a, b);
+    set_range(typename T::value_type a, typename T::value_type b, bool include_left = true, bool include_right = true) {
+        entry->range = Range<typename T::value_type>(a, b, include_left, include_right);
         return *this;
     }
 
@@ -266,6 +268,12 @@ class EntryAccess {
     EntryAccess&
     description(const std::string& desc) {
         entry->desc = desc;
+        return *this;
+    }
+
+    EntryAccess&
+    for_static() {
+        entry->type |= PARAM_TYPE::STATIC;
         return *this;
     }
 
@@ -343,48 +351,80 @@ class Config {
                 if (!(type & ptr->type)) {
                     continue;
                 }
-                if (json.find(it.first) == json.end() && !ptr->default_val.has_value()) {
-                    if (ptr->allow_empty_without_default) {
+                if (json.find(it.first) == json.end()) {
+                    if (!ptr->default_val.has_value()) {
+                        if (ptr->allow_empty_without_default) {
+                            continue;
+                        }
+                        std::string msg = "param '" + it.first + "' not exist in json";
+                        return HandleError(err_msg, msg, Status::invalid_param_in_json);
+                    } else {
+                        *ptr->val = ptr->default_val;
                         continue;
                     }
-                    LOG_KNOWHERE_ERROR_ << "Invalid param [" << it.first << "] in json.";
-                    if (err_msg) {
-                        *err_msg = std::string("invalid param ") + it.first;
-                    }
-                    return Status::invalid_param_in_json;
-                }
-                if (json.find(it.first) == json.end()) {
-                    *ptr->val = ptr->default_val;
-                    continue;
                 }
                 if (!json[it.first].is_number_integer()) {
-                    LOG_KNOWHERE_ERROR_ << "Type conflict in json: param [" << it.first << "] should be integer.";
-                    if (err_msg) {
-                        *err_msg = std::string("param ") + it.first + " should be integer";
-                    }
-                    return Status::type_conflict_in_json;
+                    std::string msg = "Type conflict in json: param '" + it.first + "' (" + to_string(json[it.first]) +
+                                      ") should be integer";
+                    return HandleError(err_msg, msg, Status::type_conflict_in_json);
                 }
                 if (ptr->range.has_value()) {
-                    if (json[it.first].get<long>() > std::numeric_limits<CFG_INT::value_type>::max()) {
-                        LOG_KNOWHERE_ERROR_ << "Arithmetic overflow: param [" << it.first << "] should be at most "
-                                            << std::numeric_limits<CFG_INT::value_type>::max();
-                        if (err_msg) {
-                            *err_msg = std::string("param ") + it.first + " should be at most 2147483647";
-                        }
-                        return Status::arithmetic_overflow;
+                    if (json[it.first].get<int64_t>() > std::numeric_limits<CFG_INT::value_type>::max()) {
+                        std::string msg = "Arithmetic overflow: param '" + it.first + "' (" +
+                                          to_string(json[it.first]) + ") should not bigger than " +
+                                          std::to_string(std::numeric_limits<CFG_INT::value_type>::max());
+                        return HandleError(err_msg, msg, Status::arithmetic_overflow);
                     }
                     CFG_INT::value_type v = json[it.first];
-                    if (ptr->range.value().first <= v && v <= ptr->range.value().second) {
+                    auto range_val = ptr->range.value();
+                    if (range_val.within(v)) {
                         *ptr->val = v;
                     } else {
-                        LOG_KNOWHERE_ERROR_ << "Out of range in json: param [" << it.first << "] should be in ["
-                                            << ptr->range.value().first << ", " << ptr->range.value().second << "].";
-                        if (err_msg) {
-                            *err_msg = std::string("param ") + it.first + " out of range " + "[ " +
-                                       std::to_string(ptr->range.value().first) + "," +
-                                       std::to_string(ptr->range.value().second) + " ]";
+                        std::string msg = "Out of range in json: param '" + it.first + "' (" +
+                                          to_string(json[it.first]) + ") should be in range " + range_val.to_string();
+                        return HandleError(err_msg, msg, Status::out_of_range_in_json);
+                    }
+                } else {
+                    *ptr->val = json[it.first];
+                }
+            }
+
+            if (const Entry<CFG_INT64>* ptr = std::get_if<Entry<CFG_INT64>>(&var)) {
+                if (!(type & ptr->type)) {
+                    continue;
+                }
+                if (json.find(it.first) == json.end()) {
+                    if (!ptr->default_val.has_value()) {
+                        if (ptr->allow_empty_without_default) {
+                            continue;
                         }
-                        return Status::out_of_range_in_json;
+                        std::string msg = "param '" + it.first + "' not exist in json";
+                        return HandleError(err_msg, msg, Status::invalid_param_in_json);
+                    } else {
+                        *ptr->val = ptr->default_val;
+                        continue;
+                    }
+                }
+                if (!json[it.first].is_number_integer()) {
+                    std::string msg = "Type conflict in json: param '" + it.first + "' (" + to_string(json[it.first]) +
+                                      ") should be long integer";
+                    return HandleError(err_msg, msg, Status::type_conflict_in_json);
+                }
+                if (ptr->range.has_value()) {
+                    if (json[it.first].get<int64_t>() > std::numeric_limits<CFG_INT64::value_type>::max()) {
+                        std::string msg = "Arithmetic overflow: param '" + it.first + "' (" +
+                                          to_string(json[it.first]) + ") should not bigger than " +
+                                          std::to_string(std::numeric_limits<CFG_INT64::value_type>::max());
+                        return HandleError(err_msg, msg, Status::arithmetic_overflow);
+                    }
+                    CFG_INT64::value_type v = json[it.first];
+                    auto range_val = ptr->range.value();
+                    if (range_val.within(v)) {
+                        *ptr->val = v;
+                    } else {
+                        std::string msg = "Out of range in json: param '" + it.first + "' (" +
+                                          to_string(json[it.first]) + ") should be in range " + range_val.to_string();
+                        return HandleError(err_msg, msg, Status::out_of_range_in_json);
                     }
                 } else {
                     *ptr->val = json[it.first];
@@ -395,52 +435,38 @@ class Config {
                 if (!(type & ptr->type)) {
                     continue;
                 }
-                if (json.find(it.first) == json.end() && !ptr->default_val.has_value()) {
-                    if (ptr->allow_empty_without_default) {
+                if (json.find(it.first) == json.end()) {
+                    if (!ptr->default_val.has_value()) {
+                        if (ptr->allow_empty_without_default) {
+                            continue;
+                        }
+                        std::string msg = "param '" + it.first + "' not exist in json";
+                        return HandleError(err_msg, msg, Status::invalid_param_in_json);
+                    } else {
+                        *ptr->val = ptr->default_val;
                         continue;
                     }
-                    LOG_KNOWHERE_ERROR_ << "Invalid param [" << it.first << "] in json.";
-                    if (err_msg) {
-                        *err_msg = std::string("invalid param ") + it.first;
-                    }
-
-                    return Status::invalid_param_in_json;
-                }
-                if (json.find(it.first) == json.end()) {
-                    *ptr->val = ptr->default_val;
-                    continue;
                 }
                 if (!json[it.first].is_number()) {
-                    LOG_KNOWHERE_ERROR_ << "Type conflict in json: param [" << it.first << "] should be a number.";
-                    if (err_msg) {
-                        *err_msg = std::string("param ") + it.first + " should be a number";
-                    }
-
-                    return Status::type_conflict_in_json;
+                    std::string msg = "Type conflict in json: param '" + it.first + "' (" + to_string(json[it.first]) +
+                                      ") should be a number";
+                    return HandleError(err_msg, msg, Status::type_conflict_in_json);
                 }
                 if (ptr->range.has_value()) {
                     if (json[it.first].get<double>() > std::numeric_limits<CFG_FLOAT::value_type>::max()) {
-                        LOG_KNOWHERE_ERROR_ << "Arithmetic overflow: param [" << it.first << "] should be at most "
-                                            << std::numeric_limits<CFG_FLOAT::value_type>::max();
-                        if (err_msg) {
-                            *err_msg = std::string("param ") + it.first + " should be at most 3.402823e+38";
-                        }
-
-                        return Status::arithmetic_overflow;
+                        std::string msg = "Arithmetic overflow: param '" + it.first + "' (" +
+                                          to_string(json[it.first]) + ") should not bigger than " +
+                                          std::to_string(std::numeric_limits<CFG_FLOAT::value_type>::max());
+                        return HandleError(err_msg, msg, Status::arithmetic_overflow);
                     }
                     CFG_FLOAT::value_type v = json[it.first];
-                    if (ptr->range.value().first <= v && v <= ptr->range.value().second) {
+                    auto range_val = ptr->range.value();
+                    if (range_val.within(v)) {
                         *ptr->val = v;
                     } else {
-                        LOG_KNOWHERE_ERROR_ << "Out of range in json: param [" << it.first << "] should be in ["
-                                            << ptr->range.value().first << ", " << ptr->range.value().second << "].";
-                        if (err_msg) {
-                            *err_msg = std::string("param ") + it.first + " out of range " + "[ " +
-                                       std::to_string(ptr->range.value().first) + "," +
-                                       std::to_string(ptr->range.value().second) + " ]";
-                        }
-
-                        return Status::out_of_range_in_json;
+                        std::string msg = "Out of range in json: param '" + it.first + "' (" +
+                                          to_string(json[it.first]) + ") should be in range " + range_val.to_string();
+                        return HandleError(err_msg, msg, Status::out_of_range_in_json);
                     }
                 } else {
                     *ptr->val = json[it.first];
@@ -451,89 +477,46 @@ class Config {
                 if (!(type & ptr->type)) {
                     continue;
                 }
-                if (json.find(it.first) == json.end() && !ptr->default_val.has_value()) {
-                    if (ptr->allow_empty_without_default) {
+                if (json.find(it.first) == json.end()) {
+                    if (!ptr->default_val.has_value()) {
+                        if (ptr->allow_empty_without_default) {
+                            continue;
+                        }
+                        std::string msg = "param [" + it.first + "] not exist in json";
+                        return HandleError(err_msg, msg, Status::invalid_param_in_json);
+                    } else {
+                        *ptr->val = ptr->default_val;
                         continue;
                     }
-                    LOG_KNOWHERE_ERROR_ << "Invalid param [" << it.first << "] in json.";
-                    if (err_msg) {
-                        *err_msg = std::string("invalid param ") + it.first;
-                    }
-                    return Status::invalid_param_in_json;
-                }
-                if (json.find(it.first) == json.end()) {
-                    *ptr->val = ptr->default_val;
-                    continue;
                 }
                 if (!json[it.first].is_string()) {
-                    LOG_KNOWHERE_ERROR_ << "Type conflict in json: param [" << it.first << "] should be a string.";
-                    if (err_msg) {
-                        *err_msg = std::string("param ") + it.first + " should be a string";
-                    }
-                    return Status::type_conflict_in_json;
+                    std::string msg = "Type conflict in json: param '" + it.first + "' (" + to_string(json[it.first]) +
+                                      ") should be a string";
+                    return HandleError(err_msg, msg, Status::type_conflict_in_json);
                 }
                 *ptr->val = json[it.first];
-            }
-
-            if (const Entry<CFG_LIST>* ptr = std::get_if<Entry<CFG_LIST>>(&var)) {
-                if (!(type & ptr->type)) {
-                    continue;
-                }
-                if (json.find(it.first) == json.end() && !ptr->default_val.has_value()) {
-                    if (ptr->allow_empty_without_default) {
-                        continue;
-                    }
-                    LOG_KNOWHERE_ERROR_ << "Invalid param [" << it.first << "] in json.";
-                    if (err_msg) {
-                        *err_msg = std::string("invalid param ") + it.first;
-                    }
-
-                    return Status::invalid_param_in_json;
-                }
-                if (json.find(it.first) == json.end()) {
-                    *ptr->val = ptr->default_val;
-                    continue;
-                }
-                if (!json[it.first].is_array()) {
-                    LOG_KNOWHERE_ERROR_ << "Type conflict in json: param [" << it.first << "] should be an array.";
-                    if (err_msg) {
-                        *err_msg = std::string("param ") + it.first + " should be an array";
-                    }
-
-                    return Status::type_conflict_in_json;
-                }
-                *ptr->val = CFG_LIST::value_type();
-                for (auto&& i : json[it.first]) {
-                    ptr->val->value().push_back(i);
-                }
             }
 
             if (const Entry<CFG_BOOL>* ptr = std::get_if<Entry<CFG_BOOL>>(&var)) {
                 if (!(type & ptr->type)) {
                     continue;
                 }
-                if (json.find(it.first) == json.end() && !ptr->default_val.has_value()) {
-                    if (ptr->allow_empty_without_default) {
+                if (json.find(it.first) == json.end()) {
+                    if (!ptr->default_val.has_value()) {
+                        if (ptr->allow_empty_without_default) {
+                            continue;
+                        }
+                        std::string msg = "param '" + it.first + "' not exist in json";
+                        return HandleError(err_msg, msg, Status::invalid_param_in_json);
+                    } else {
+                        *ptr->val = ptr->default_val;
                         continue;
                     }
-                    LOG_KNOWHERE_ERROR_ << "Invalid param [" << it.first << "] in json.";
-                    if (err_msg) {
-                        *err_msg = std::string("invalid param ") + it.first;
-                    }
-
-                    return Status::invalid_param_in_json;
-                }
-                if (json.find(it.first) == json.end()) {
-                    *ptr->val = ptr->default_val;
-                    continue;
                 }
                 if (!json[it.first].is_boolean()) {
-                    LOG_KNOWHERE_ERROR_ << "Type conflict in json: param [" << it.first << "] should be a boolean.";
-                    if (err_msg) {
-                        *err_msg = std::string("param ") + it.first + " should be a boolean";
-                    }
-
-                    return Status::type_conflict_in_json;
+                    std::string msg = "Type conflict in json: param '" + it.first + "' (" + to_string(json[it.first]) +
+                                      ") should be a boolean";
+                    return HandleError(err_msg, msg, Status::type_conflict_in_json);
                 }
                 *ptr->val = json[it.first];
             }
@@ -543,118 +526,161 @@ class Config {
                 if (!(type & ptr->type)) {
                     continue;
                 }
-                if (json.find(it.first) == json.end() && !ptr->default_val.has_value()) {
-                    if (ptr->allow_empty_without_default) {
+                if (json.find(it.first) == json.end()) {
+                    if (!ptr->default_val.has_value()) {
+                        if (ptr->allow_empty_without_default) {
+                            continue;
+                        }
+                        std::string msg = "param '" + it.first + "' not exist in json";
+                        return HandleError(err_msg, msg, Status::invalid_param_in_json);
+                    } else {
+                        *ptr->val = ptr->default_val;
                         continue;
                     }
-                    LOG_KNOWHERE_ERROR_ << "Invalid param [" << it.first << "] in json.";
-                    if (err_msg) {
-                        *err_msg = std::string("invalid param ") + it.first;
-                    }
-                    return Status::invalid_param_in_json;
-                }
-                if (json.find(it.first) == json.end()) {
-                    *ptr->val = ptr->default_val;
-                    continue;
                 }
                 *ptr->val = json[it.first];
             }
-
-            if (const Entry<CFG_BYTES>* ptr = std::get_if<Entry<CFG_BYTES>>(&var)) {
-                if (!(type & ptr->type)) {
-                    continue;
-                }
-                if (json.find(it.first) == json.end() && !ptr->default_val.has_value()) {
-                    if (ptr->allow_empty_without_default) {
-                        continue;
-                    }
-                    LOG_KNOWHERE_ERROR_ << "Invalid param [" << it.first << "] in json.";
-                    if (err_msg) {
-                        *err_msg = std::string("invalid param ") + it.first;
-                    }
-                    return Status::invalid_param_in_json;
-                }
-                if (json.find(it.first) == json.end()) {
-                    *ptr->val = ptr->default_val;
-                    continue;
-                }
-                if (!json[it.first].is_array()) {
-                    LOG_KNOWHERE_ERROR_ << "Type conflict in json: param [" << it.first << "] should be an array.";
-                    if (err_msg) {
-                        *err_msg = std::string("param ") + it.first + " should be an array";
-                    }
-                    return Status::type_conflict_in_json;
-                }
-                *ptr->val = CFG_BYTES::value_type();
-                for (auto&& i : json[it.first]) {
-                    ptr->val->value().push_back(i);
-                }
-            }
         }
 
-        if (!err_msg) {
-            std::string tem_msg;
-            return cfg.CheckAndAdjust(type, &tem_msg);
-        }
-        return cfg.CheckAndAdjust(type, err_msg);
+        std::string local_error;
+        auto* error = err_msg ? err_msg : &local_error;
+        const auto status = cfg.LoadSubConfig(json, type, error);
+        return status == Status::success ? cfg.CheckAndAdjust(type, error) : status;
     }
 
     virtual ~Config() {
     }
 
-    using VarEntry = std::variant<Entry<CFG_STRING>, Entry<CFG_FLOAT>, Entry<CFG_INT>, Entry<CFG_LIST>, Entry<CFG_BOOL>,
-                                  Entry<CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE>, Entry<CFG_BYTES>>;
+    using VarEntry = std::variant<Entry<CFG_STRING>, Entry<CFG_FLOAT>, Entry<CFG_INT>, Entry<CFG_INT64>,
+                                  Entry<CFG_BOOL>, Entry<CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE>>;
     std::unordered_map<std::string, VarEntry> __DICT__;
 
  protected:
+    virtual Status
+    LoadSubConfig(const Json&, PARAM_TYPE, std::string*) {
+        return Status::success;
+    }
     inline virtual Status
     CheckAndAdjust(PARAM_TYPE param_type, std::string* const err_msg) {
         return Status::success;
     }
+
+    static knowhere::Status
+    HandleError(std::string* error_msg, const std::string& msg, const knowhere::Status& status) {
+        if (error_msg) {
+            *error_msg = msg;
+        }
+        LOG_KNOWHERE_ERROR_ << msg;
+        return status;
+    }
 };
 
-#define KNOHWERE_DECLARE_CONFIG(CONFIG) CONFIG()
+#define KNOWHERE_DECLARE_CONFIG(CONFIG) CONFIG()
 
-#define KNOWHERE_CONFIG_DECLARE_FIELD(PARAM)                                                             \
-    __DICT__[#PARAM] = knowhere::Config::VarEntry(std::in_place_type<Entry<decltype(PARAM)>>, &PARAM);   \
-    EntryAccess<decltype(PARAM)> PARAM##_access(std::get_if<Entry<decltype(PARAM)>>(&__DICT__[#PARAM])); \
+#define KNOWHERE_CONFIG_DECLARE_FIELD(PARAM)                                                                     \
+    __DICT__[#PARAM] = knowhere::Config::VarEntry(std::in_place_type<knowhere::Entry<decltype(PARAM)>>, &PARAM); \
+    knowhere::EntryAccess<decltype(PARAM)> PARAM##_access(                                                       \
+        std::get_if<knowhere::Entry<decltype(PARAM)>>(&__DICT__[#PARAM]));                                       \
     PARAM##_access
 
 const float defaultRangeFilter = 1.0f / 0.0;
 
 class BaseConfig : public Config {
  public:
+    CFG_INT64 dim;  // just used for config verify
     CFG_STRING metric_type;
     CFG_INT k;
     CFG_INT num_build_thread;
     CFG_BOOL retrieve_friendly;
     CFG_STRING data_path;
     CFG_STRING index_prefix;
+    // the size of the raw vector data
+    CFG_FLOAT vec_field_size_gb;
     // for distance metrics, we search for vectors with distance in [range_filter, radius).
     // for similarity metrics, we search for vectors with similarity in (radius, range_filter].
     CFG_FLOAT radius;
+    CFG_INT range_search_k;
     CFG_FLOAT range_filter;
+    CFG_FLOAT range_search_level;
+    CFG_BOOL retain_iterator_order;
     CFG_BOOL trace_visit;
     CFG_BOOL enable_mmap;
     CFG_BOOL enable_mmap_pop;
-    CFG_BOOL for_tuning;
     CFG_BOOL shuffle_build;
-    CFG_BYTES trace_id;
-    CFG_BYTES span_id;
+    CFG_STRING trace_id;
+    CFG_STRING span_id;
     CFG_INT trace_flags;
     CFG_MATERIALIZED_VIEW_SEARCH_INFO_TYPE materialized_view_search_info;
     CFG_STRING opt_fields_path;
     CFG_FLOAT iterator_refine_ratio;
-    KNOHWERE_DECLARE_CONFIG(BaseConfig) {
+    CFG_FLOAT mrl_refine_ratio;
+    /**
+     * k1, b, avgdl are used by BM25 metric only.
+     * - k1, b, avgdl must be provided at load time.
+     * - k1 and b can be overridden at search time for SPARSE_INVERTED_INDEX
+     *   but not for SPARSE_WAND.
+     * - avgdl must always be provided at search time.
+     */
+    CFG_FLOAT bm25_k1;
+    CFG_FLOAT bm25_b;
+    CFG_FLOAT bm25_avgdl;
+    /*
+     * mh_lsh_band is a special parameters of BF search and MinHash index node train.
+     */
+    CFG_INT mh_lsh_band;
+    CFG_BOOL mh_search_with_jaccard;
+    CFG_INT mh_element_bit_width;
+    /*
+     * retrieval_ann_ratio only used for emb_list index search.
+     * - A factor for top-k in the first ANNS round.
+     */
+    CFG_FLOAT retrieval_ann_ratio;
+    CFG_STRING emb_list_meta_file_path;       // for mmap
+    CFG_STRING emb_list_raw_index_file_path;  // for mmap (raw vector index)
+    CFG_STRING emb_list_offset_file_path;     // for build
+    /*
+     * emb_list_strategy: encoding strategy for multi-vector documents.
+     * - "tokenann": Index all vectors, aggregate scores at search time (default)
+     * - "muvera": Encode documents to single vectors using FDE, rerank with MaxSim
+     * - "lemur": Learn MLP to compress documents to fixed-dim vectors, ANN search on learned representations, rerank
+     * with MaxSim
+     */
+    CFG_STRING emb_list_strategy;
+    CFG_INT muvera_num_projections;  // FDE projections count, buckets = 2^projections
+    CFG_INT muvera_num_repeats;      // FDE repeat count (independent encodings)
+    CFG_INT muvera_seed;             // random seed for SimHash projection matrices
+    // LEMUR config
+    CFG_INT lemur_hidden_dim;         // hidden dimension for LEMUR MLP (compressed representation)
+    CFG_INT lemur_num_train_samples;  // number of training samples for MLP
+    CFG_INT lemur_num_epochs;         // number of training epochs
+    CFG_INT lemur_batch_size;         // batch size for MLP training
+    CFG_FLOAT lemur_learning_rate;    // learning rate for MLP training
+    CFG_INT lemur_seed;               // random seed for LEMUR
+    CFG_INT lemur_num_layers;         // number of layers in feature_extractor
+    CFG_BOOL emb_list_rerank;         // whether to perform MaxSim reranking after ANN search
+
+    /// Optional hook: runs after FormatAndCheck and before Config::Load consumes typed
+    /// fields. Used by FaissConfig to capture the raw JSON verbatim for pass-through to
+    /// faiss's ParameterSpace. Default is a no-op; do NOT override unless you need raw
+    /// JSON (most configs should rely on KNOWHERE_CONFIG_DECLARE_FIELD).
+    virtual void
+    CaptureRawJson(const Json& /*json*/) {
+    }
+
+    KNOWHERE_DECLARE_CONFIG(BaseConfig) {
+        KNOWHERE_CONFIG_DECLARE_FIELD(dim).allow_empty_without_default().description("vector dim").for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(metric_type)
             .set_default("L2")
             .description("metric type")
             .for_train_and_search()
+            .for_static()
             .for_iterator()
-            .for_deserialize();
+            .for_deserialize()
+            .for_deserialize_from_file();
         KNOWHERE_CONFIG_DECLARE_FIELD(retrieve_friendly)
             .description("whether the index holds raw data for fast retrieval")
             .set_default(false)
+            .for_static()
             .for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(data_path)
             .description("raw data path.")
@@ -665,6 +691,10 @@ class BaseConfig : public Config {
             .allow_empty_without_default()
             .for_train()
             .for_deserialize();
+        KNOWHERE_CONFIG_DECLARE_FIELD(vec_field_size_gb)
+            .description("the size (in GB) of the raw vector data.")
+            .set_default(0)
+            .for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(k)
             .set_default(10)
             .description("search for top k similar vector.")
@@ -673,15 +703,25 @@ class BaseConfig : public Config {
         KNOWHERE_CONFIG_DECLARE_FIELD(num_build_thread)
             .description("index thread limit for build.")
             .allow_empty_without_default()
-            .set_range(1, std::thread::hardware_concurrency())
-            .for_train();
+            .for_train()
+            .for_cluster();
         KNOWHERE_CONFIG_DECLARE_FIELD(radius)
             .set_default(0.0)
             .description("radius for range search")
             .for_range_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(range_search_k)
+            .set_default(-1)
+            .description("limit the number of similar results returned by range_search. -1 means no limitations.")
+            .set_range(-1, std::numeric_limits<CFG_INT::value_type>::max())
+            .for_range_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(range_filter)
             .set_default(defaultRangeFilter)
             .description("result filter for range search")
+            .for_range_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(range_search_level)
+            .set_default(0.01f)
+            .description("control the accurancy of range search, [0.0 - 0.5], the larger the more accurate")
+            .set_range(0, 0.5)
             .for_range_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(trace_visit)
             .set_default(false)
@@ -691,6 +731,7 @@ class BaseConfig : public Config {
         KNOWHERE_CONFIG_DECLARE_FIELD(enable_mmap)
             .set_default(false)
             .description("enable mmap for load index")
+            .for_static()
             .for_deserialize()
             .for_deserialize_from_file();
         KNOWHERE_CONFIG_DECLARE_FIELD(enable_mmap_pop)
@@ -698,7 +739,6 @@ class BaseConfig : public Config {
             .description("enable map_populate option for mmap")
             .for_deserialize()
             .for_deserialize_from_file();
-        KNOWHERE_CONFIG_DECLARE_FIELD(for_tuning).set_default(false).description("for tuning").for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(shuffle_build)
             .set_default(true)
             .description("shuffle ids before index building")
@@ -722,6 +762,7 @@ class BaseConfig : public Config {
             .description("materialized view search info")
             .allow_empty_without_default()
             .for_search()
+            .for_iterator()
             .for_range_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(opt_fields_path)
             .description("materialized view optional fields path")
@@ -732,6 +773,131 @@ class BaseConfig : public Config {
             .description("refine ratio for iterator")
             .for_iterator()
             .for_range_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(mrl_refine_ratio)
+            .set_default(1.0f)
+            .set_range(1.0f, std::numeric_limits<float>::max())
+            .description("candidate multiplier for full-dimensional MRL refinement")
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(retain_iterator_order)
+            .set_default(false)
+            .description("whether the result of iterator monotonically ordered")
+            .for_iterator()
+            .for_range_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(bm25_k1)
+            .allow_empty_without_default()
+            .set_range(0.0, 3.0)
+            .description("BM25 k1 to tune the term frequency scaling factor")
+            .for_train_and_search()
+            .for_iterator()
+            .for_deserialize()
+            .for_deserialize_from_file();
+        KNOWHERE_CONFIG_DECLARE_FIELD(bm25_b)
+            .allow_empty_without_default()
+            .set_range(0.0, 1.0)
+            .description("BM25 beta to tune the document length scaling factor")
+            .for_train_and_search()
+            .for_iterator()
+            .for_deserialize()
+            .for_deserialize_from_file();
+        // This must be provided in any BM25 type search request.
+        // This is necessary for building/training/deserializing only if the index
+        // type is WAND.
+        KNOWHERE_CONFIG_DECLARE_FIELD(bm25_avgdl)
+            .allow_empty_without_default()
+            .set_range(0, std::numeric_limits<CFG_FLOAT::value_type>::max())
+            .description("average document length")
+            .for_train_and_search()
+            .for_iterator()
+            .for_deserialize()
+            .for_deserialize_from_file();
+        KNOWHERE_CONFIG_DECLARE_FIELD(mh_lsh_band)
+            .description("param of MinHashLSH")
+            .set_default(1)
+            .for_train()
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(mh_element_bit_width)
+            .description("sizeof(hash code), the hash element should be aligned on 8 bits")
+            .set_default(8)
+            .set_range(8, 256)
+            .for_train()
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(mh_search_with_jaccard)
+            .description("return the jaccard distance of minhash vector search or minhashlsh hit flag.")
+            .set_default(false)
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(retrieval_ann_ratio)
+            .description("Factor for top-k in the first ANNS round, only used for emb_list")
+            .set_default(3.0f)
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(emb_list_meta_file_path)
+            .description("file name of emb_list meta for mmap load")
+            .allow_empty_without_default()
+            .for_deserialize()
+            .for_deserialize_from_file();
+        KNOWHERE_CONFIG_DECLARE_FIELD(emb_list_raw_index_file_path)
+            .description("file name of emb_list raw vector index for mmap load")
+            .allow_empty_without_default()
+            .for_deserialize_from_file();
+        KNOWHERE_CONFIG_DECLARE_FIELD(emb_list_offset_file_path)
+            .description("file name of emb_list offsets for build")
+            .allow_empty_without_default()
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(emb_list_strategy)
+            .description("EmbList encoding strategy: tokenann or muvera")
+            .set_default("tokenann")
+            .for_train()
+            .for_deserialize()
+            .for_deserialize_from_file();
+        KNOWHERE_CONFIG_DECLARE_FIELD(muvera_num_projections)
+            .description("Number of SimHash projections for MUVERA FDE, buckets = 2^projections")
+            .set_default(4)
+            .set_range(1, 7)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(muvera_num_repeats)
+            .description("Number of repeats for MUVERA FDE encoding")
+            .set_default(7)
+            .set_range(1, 32)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(muvera_seed)
+            .description("Random seed for MUVERA SimHash projection matrices")
+            .set_default(42)
+            .for_train();
+        // LEMUR config
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_hidden_dim)
+            .description("Hidden dimension for LEMUR MLP (compressed representation dimension)")
+            .set_default(256)
+            .set_range(8, 8192)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_num_train_samples)
+            .description("Number of training samples for LEMUR MLP")
+            .set_default(20000)
+            .set_range(1000, 100000)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_num_epochs)
+            .description("Number of training epochs for LEMUR MLP")
+            .set_default(50)
+            .set_range(1, 1000)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_batch_size)
+            .description("Batch size for LEMUR MLP training")
+            .set_default(512)
+            .set_range(1, 4096)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_learning_rate)
+            .description("Learning rate for LEMUR MLP training")
+            .set_default(0.001f)
+            .set_range(0.00001f, 1.0f)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_seed).description("Random seed for LEMUR").set_default(42).for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(lemur_num_layers)
+            .description("Number of layers in LEMUR feature_extractor")
+            .set_default(2)
+            .set_range(1, 8)
+            .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(emb_list_rerank)
+            .description("Whether to perform MaxSim reranking after ANN search")
+            .set_default(true)
+            .for_search();
     }
 };
 }  // namespace knowhere

@@ -3,12 +3,12 @@
 
 #pragma once
 #include <algorithm>
-#include <fcntl.h>
-#include <future>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -22,16 +22,14 @@
 
 #include "cached_io.h"
 #include "common_includes.h"
-#include "tsl/robin_set.h"
-
-#include "utils.h"
-#include "knowhere/comp/thread_pool.h"
 #include "diskann/index.h"
-
+#include "diskann/navigation_runtime.h"
+#include "tsl/robin_set.h"
+#include "utils.h"
+#include "diskann/defaults.h"
 typedef int FileHandle;
 
 namespace diskann {
-  constexpr size_t MAX_N_SECTOR_READS = 256;
   const size_t     MAX_PQ_TRAINING_SET_SIZE = 256000;
   const size_t     MAX_SAMPLE_POINTS_FOR_WARMUP = 100000;
   const double     PQ_TRAINING_SET_FRACTION = 0.1;
@@ -42,7 +40,7 @@ namespace diskann {
   const uint32_t   NUM_KMEANS_REPS = 12;
 
   template<typename T>
-  class PQFlashIndex;
+  class SSDGraphIndex;
 
   double get_memory_budget(const std::string &mem_budget_str);
   double get_memory_budget(double search_ram_budget_in_gb);
@@ -92,16 +90,16 @@ namespace diskann {
       std::string centroids_file);
 
   template<typename T>
-  void generate_cache_list_from_graph_with_pq(
+  void generate_cache_list_from_graph(
       _u64 num_nodes_to_cache, unsigned R, const diskann::Metric compare_metric,
-      const std::string &sample_file, const std::string &pq_pivots_path,
-      const std::string &pq_compressed_code_path, const unsigned entry_point,
+      const std::string &sample_file, const NavigationStore &navigation,
+      const unsigned                            entry_point,
       const std::vector<std::vector<unsigned>> &graph,
       const std::string                        &cache_file);
 
   template<typename T>
   uint32_t optimize_beamwidth(
-      std::unique_ptr<diskann::PQFlashIndex<T>> &_pFlashIndex, T *tuning_sample,
+      std::unique_ptr<diskann::SSDGraphIndex<T>> &_pFlashIndex, T *tuning_sample,
       _u64 tuning_sample_num, _u64 tuning_sample_aligned_dim, uint32_t L,
       uint32_t nthreads, uint32_t start_bw = 2);
 
@@ -113,8 +111,6 @@ namespace diskann {
     unsigned max_degree = 0;
     // L (indexing list size, better if >= R)
     unsigned search_list_size = 0;
-    // B (PQ code size in GB)
-    double pq_code_size_gb = 0.0;
     // M (memory limit while indexing)
     double index_mem_gb = 0.0;
     // B' (PQ dim for disk index: optional parameter for very
@@ -123,21 +119,36 @@ namespace diskann {
     // reorder (set true to include full precision in data file:
     // optional paramter, use only when using disk PQ
     bool reorder = false;
-    // acclerate the index build ~30% and lose ~1% recall
+    // accelerate the index build ~30% and lose ~1% recall
     bool accelerate_build = false;
     // the cached nodes number
     uint32_t num_nodes_to_cache = 0;
     // shuffle id to build index
     bool shuffle_build = false;
+    // choose AiSAQ algorithm
+    bool aisaq_mode = false;
+    uint32_t inline_pq = 0;
+    bool rearrange = false;
+    int num_entry_points = 0;
   };
 
   template<typename T>
-  int build_disk_index(const BuildConfig &config);
+  int build_disk_index(BuildConfig &config, NavigationStore &navigation);
 
-  template<typename T>
-  void create_disk_layout(
+  template <typename T>
+  void create_aisaq_layout(const std::string base_file, const std::string mem_index_file, const std::string output_file,
+                           const std::string reorder_data_file,
+                           const std::string &index_prefix_path,
+                           int inline_pq /* control num of inline pq: -1=none, 0=auto, others: num of pq vectors <= R */,
+                           bool &rearrange /* enable vectors reaarangement */);
+  
+  template <typename T>
+  void aisaq_calc_inline_layout(int inline_pq, uint32_t pq_compressed_nbytes, uint32_t max_degree, bool &rearrange,
+                                uint32_t &inline_pq_vectors, uint64_t &max_node_len);
+
+template<typename T>
+    void create_disk_layout(
       const std::string base_file, const std::string mem_index_file,
       const std::string output_file,
       const std::string reorder_data_file = std::string(""));
-
 }  // namespace diskann

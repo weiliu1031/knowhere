@@ -18,7 +18,8 @@
 #include <thread>
 #include <utility>
 
-#include "knowhere/comp/thread_pool.h"
+#include "folly/executors/CPUThreadPoolExecutor.h"
+#include "knowhere/comp/task.h"
 
 namespace knowhere {
 
@@ -29,7 +30,7 @@ ExecOverSearchThreadPool(std::vector<std::function<void()>>& tasks) {
     futures.reserve(tasks.size());
     for (auto&& t : tasks) {
         futures.emplace_back(pool->push([&t]() {
-            ThreadPool::ScopedOmpSetter setter(1);
+            ThreadPool::ScopedSearchOmpSetter setter(1);
             t();
         }));
     }
@@ -44,7 +45,7 @@ ExecOverBuildThreadPool(std::vector<std::function<void()>>& tasks) {
     futures.reserve(tasks.size());
     for (auto&& t : tasks) {
         futures.emplace_back(pool->push([&t]() {
-            ThreadPool::ScopedOmpSetter setter(1);
+            ThreadPool::ScopedBuildOmpSetter setter(1);
             t();
         }));
     }
@@ -55,6 +56,16 @@ ExecOverBuildThreadPool(std::vector<std::function<void()>>& tasks) {
 void
 InitBuildThreadPool(uint32_t num_threads) {
     ThreadPool::InitGlobalBuildThreadPool(num_threads);
+}
+
+folly::CPUThreadPoolExecutor&
+GetBuildThreadPool() {
+    return ThreadPool::GetGlobalBuildThreadPool()->GetPool();
+}
+
+folly::CPUThreadPoolExecutor&
+GetSearchThreadPool() {
+    return ThreadPool::GetGlobalSearchThreadPool()->GetPool();
 }
 
 void
@@ -72,9 +83,14 @@ GetBuildThreadPoolSize() {
     return ThreadPool::GetGlobalBuildThreadPool()->size();
 }
 
-std::unique_ptr<ThreadPool::ScopedOmpSetter>
-CreateScopeOmpSetter(int num_threads) {
-    return std::make_unique<ThreadPool::ScopedOmpSetter>(num_threads);
+std::unique_ptr<ThreadPool::ScopedBuildOmpSetter>
+CreateScopeBuildOmpSetter(int num_threads) {
+    return std::make_unique<ThreadPool::ScopedBuildOmpSetter>(num_threads);
+}
+
+std::unique_ptr<ThreadPool::ScopedSearchOmpSetter>
+CreateScopeSearchOmpSetter(int num_threads) {
+    return std::make_unique<ThreadPool::ScopedSearchOmpSetter>(num_threads);
 }
 
 }  // namespace knowhere

@@ -11,7 +11,17 @@
 
 #include "knowhere/config.h"
 
+#include "index/flat/flat_config.h"
+#include "index/gpu_cuvs/gpu_cuvs_brute_force_config.h"
+#include "index/gpu_cuvs/gpu_cuvs_cagra_config.h"
+#include "index/gpu_cuvs/gpu_cuvs_ivf_flat_config.h"
+#include "index/gpu_cuvs/gpu_cuvs_ivf_pq_config.h"
+#include "index/hnsw/hnsw_config.h"
+#include "index/ivf/ivf_config.h"
+#include "index/sparse/sparse_index_config.h"
+#include "knowhere/index/index_factory.h"
 #include "knowhere/log.h"
+
 namespace knowhere {
 
 static const std::unordered_set<std::string> ext_legal_json_keys = {"metric_type",
@@ -25,7 +35,6 @@ static const std::unordered_set<std::string> ext_legal_json_keys = {"metric_type
                                                                     "M",               // HNSW param
                                                                     "efConstruction",  // HNSW param
                                                                     "ef",              // HNSW param
-                                                                    "seed_ef",         // HNSW iterator param
                                                                     "level",
                                                                     "index_type",
                                                                     "index_mode",
@@ -49,7 +58,6 @@ static const std::unordered_set<std::string> ext_legal_json_keys = {"metric_type
                                                                     "num_threads",
                                                                     "round_decimal",
                                                                     "offset",
-                                                                    "for_tuning",
                                                                     "index_engine_version",
                                                                     "reorder_k"};
 
@@ -78,35 +86,86 @@ Config::FormatAndCheck(const Config& cfg, Json& json, std::string* const err_msg
             if (json.find(it.first) != json.end() && json[it.first].is_string()) {
                 if (std::get_if<Entry<CFG_INT>>(&var)) {
                     std::string::size_type sz;
-                    auto value_str = json[it.first].get<std::string>();
-                    CFG_INT::value_type v = std::stoi(value_str.c_str(), &sz);
-                    if (sz < value_str.length()) {
-                        throw KnowhereException(std::string("wrong data type in json ") + value_str);
+                    auto key_str = it.first;
+                    auto value_str = json[key_str].get<std::string>();
+                    try {
+                        int64_t v = std::stoll(value_str, &sz);
+                        if (sz < value_str.length()) {
+                            KNOWHERE_THROW_MSG("wrong data type in json, key: '" + key_str + "', value: '" + value_str +
+                                               "'");
+                        }
+                        if (v < std::numeric_limits<CFG_INT::value_type>::min() ||
+                            v > std::numeric_limits<CFG_INT::value_type>::max()) {
+                            std::string msg =
+                                "integer value out of range, key: '" + key_str + "', value: '" + value_str + "'";
+                            return HandleError(err_msg, msg, Status::invalid_value_in_json);
+                        }
+                        json[key_str] = static_cast<CFG_INT::value_type>(v);
+                    } catch (const std::out_of_range&) {
+                        std::string msg =
+                            "integer value out of range, key: '" + key_str + "', value: '" + value_str + "'";
+                        return HandleError(err_msg, msg, Status::invalid_value_in_json);
+                    } catch (const std::invalid_argument&) {
+                        std::string msg = "invalid integer value, key: '" + key_str + "', value: '" + value_str + "'";
+                        return HandleError(err_msg, msg, Status::invalid_value_in_json);
                     }
-                    json[it.first] = v;
+                }
+                if (std::get_if<Entry<CFG_INT64>>(&var)) {
+                    std::string::size_type sz;
+                    auto key_str = it.first;
+                    auto value_str = json[key_str].get<std::string>();
+                    try {
+                        int64_t v = std::stoll(value_str, &sz);
+                        if (sz < value_str.length()) {
+                            KNOWHERE_THROW_MSG("wrong data type in json, key: '" + key_str + "', value: '" + value_str +
+                                               "'");
+                        }
+                        if (v < std::numeric_limits<CFG_INT64::value_type>::min() ||
+                            v > std::numeric_limits<CFG_INT64::value_type>::max()) {
+                            std::string msg =
+                                "long integer value out of range, key: '" + key_str + "', value: '" + value_str + "'";
+                            return HandleError(err_msg, msg, Status::invalid_value_in_json);
+                        }
+                        json[key_str] = static_cast<CFG_INT64::value_type>(v);
+                    } catch (const std::out_of_range&) {
+                        std::string msg =
+                            "long integer value out of range, key: '" + key_str + "', value: '" + value_str + "'";
+                        return HandleError(err_msg, msg, Status::invalid_value_in_json);
+                    } catch (const std::invalid_argument&) {
+                        std::string msg =
+                            "invalid long integer value, key: '" + key_str + "', value: '" + value_str + "'";
+                        return HandleError(err_msg, msg, Status::invalid_value_in_json);
+                    }
                 }
                 if (std::get_if<Entry<CFG_FLOAT>>(&var)) {
-                    CFG_FLOAT::value_type v = std::stof(json[it.first].get<std::string>().c_str());
-                    json[it.first] = v;
+                    auto key_str = it.first;
+                    auto value_str = json[key_str].get<std::string>();
+                    try {
+                        CFG_FLOAT::value_type v = std::stof(json[it.first].get<std::string>().c_str());
+                        json[it.first] = v;
+                    } catch (const std::out_of_range&) {
+                        std::string msg =
+                            "float value out of range, key: '" + key_str + "', value: '" + value_str + "'";
+                        return HandleError(err_msg, msg, Status::invalid_value_in_json);
+                    } catch (const std::invalid_argument&) {
+                        std::string msg = "invalid float value, key: '" + key_str + "', value: '" + value_str + "'";
+                        return HandleError(err_msg, msg, Status::invalid_value_in_json);
+                    }
                 }
-
                 if (std::get_if<Entry<CFG_BOOL>>(&var)) {
-                    if (json[it.first] == "true") {
+                    if (json[it.first] == "true" || json[it.first] == "True" || json[it.first] == "TRUE") {
                         json[it.first] = true;
                     }
-                    if (json[it.first] == "false") {
+                    if (json[it.first] == "false" || json[it.first] == "False" || json[it.first] == "FALSE") {
                         json[it.first] = false;
                     }
                 }
             }
         }
     } catch (std::exception& e) {
-        LOG_KNOWHERE_ERROR_ << e.what();
-        if (err_msg) {
-            *err_msg = e.what();
-        }
-        return Status::invalid_value_in_json;
+        return HandleError(err_msg, e.what(), Status::invalid_value_in_json);
     }
     return Status::success;
 }
+
 }  // namespace knowhere

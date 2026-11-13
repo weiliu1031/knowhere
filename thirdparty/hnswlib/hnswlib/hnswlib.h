@@ -132,11 +132,10 @@ AVX512Capable() {
 #include <vector>
 
 #include "io/memory_io.h"
-#include "neighbor.h"
-
 #include "knowhere/bitsetview.h"
 #include "knowhere/feder/HNSW.h"
 #include "knowhere/object.h"
+#include "neighbor.h"
 
 namespace hnswlib {
 typedef int64_t labeltype;
@@ -177,23 +176,21 @@ class SpaceInterface {
 
 struct SearchParam {
     size_t ef_;
-    bool for_tuning;
 };
 
 struct IteratorWorkspace {
-    IteratorWorkspace(std::unique_ptr<int8_t[]> query_data_sq, const size_t num_elements, const size_t seed_ef,
-                      const bool for_tuning, std::unique_ptr<int8_t[]> raw_query_data,
-                      const knowhere::BitsetView& bitset, float accumulative_alpha)
+    IteratorWorkspace(std::unique_ptr<int8_t[]> query_data_sq, const size_t num_elements, const size_t ef,
+                      std::unique_ptr<int8_t[]> raw_query_data, const knowhere::BitsetView& bitset,
+                      float accumulative_alpha)
         : query_data(query_data_sq ? (const void*)(query_data_sq.get()) : (const void*)(raw_query_data.get())),
           query_data_sq(std::move(query_data_sq)),
           visited(num_elements),
-          seed_ef(seed_ef),
+          ef(ef),
           param(std::make_unique<SearchParam>()),
           raw_query_data(std::move(raw_query_data)),
           bitset(bitset),
           accumulative_alpha(accumulative_alpha) {
         param->ef_ = 0;
-        param->for_tuning = for_tuning;
     }
     const void* query_data;
 
@@ -208,7 +205,7 @@ struct IteratorWorkspace {
     // thus creating a new visited list for every new iteration request.
     std::vector<bool> visited;
     std::vector<knowhere::DistId> dists;
-    const size_t seed_ef;
+    const size_t ef;
     std::unique_ptr<SearchParam> param;
     // though named raw_query_vector, it is normalized for cosine metric. used
     // only for refinement when quantization is enabled.
@@ -231,7 +228,7 @@ class AlgorithmInterface {
               const knowhere::feder::hnsw::FederResultUniq&) const = 0;
 
     virtual std::unique_ptr<IteratorWorkspace>
-    getIteratorWorkspace(const void*, const size_t, const bool, const knowhere::BitsetView&) const = 0;
+    getIteratorWorkspace(const void*, const size_t, const knowhere::BitsetView&) const = 0;
 
     virtual void
     getIteratorNextBatch(IteratorWorkspace*, const knowhere::feder::hnsw::FederResultUniq&) const = 0;

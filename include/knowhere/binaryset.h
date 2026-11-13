@@ -12,6 +12,7 @@
 #ifndef BINARYSET_H
 #define BINARYSET_H
 
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -87,6 +88,18 @@ class BinarySet {
     bool
     Contains(const std::string& key) const {
         return binary_map_.find(key) != binary_map_.end();
+    }
+
+    // Return the total size of all binary data in binary set.
+    size_t
+    Size() const {
+        size_t size = 0;
+        for (auto& pair : binary_map_) {
+            if (pair.second != nullptr) {
+                size += pair.second->size;
+            }
+        }
+        return size;
     }
 
  public:

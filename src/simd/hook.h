@@ -12,8 +12,25 @@
 #ifndef HOOK_H
 #define HOOK_H
 
+#include <faiss/cppcontrib/knowhere/utils/distances.h>
+
 #include <string>
+
+#include "knowhere/operands.h"
+
 namespace faiss {
+namespace cppcontrib {
+namespace knowhere {
+
+#if defined(__x86_64__)
+// Allow FAISS to select its finer SIMD tiers only in AUTO mode.
+extern bool use_simd_auto;
+extern bool use_avx512;
+extern bool use_avx2;
+extern bool use_sse4_2;
+#endif
+
+extern bool support_pq_fast_scan;
 
 /// inner product
 extern float (*fvec_inner_product)(const float*, const float*, size_t);
@@ -70,18 +87,60 @@ extern void (*fvec_inner_product_batch_4)(const float*, const float*, const floa
 extern void (*fvec_L2sqr_batch_4)(const float*, const float*, const float*, const float*, const float*, const size_t,
                                   float&, float&, float&, float&);
 
+// for hnsw sq, obsolete
 extern int32_t (*ivec_inner_product)(const int8_t*, const int8_t*, size_t);
-
 extern int32_t (*ivec_L2sqr)(const int8_t*, const int8_t*, size_t);
 
-#if defined(__x86_64__)
-extern bool use_avx512;
-extern bool use_avx2;
-extern bool use_sse4_2;
-#endif
+// fp16
+extern float (*fp16_vec_inner_product)(const ::knowhere::fp16*, const ::knowhere::fp16*, size_t);
+extern float (*fp16_vec_L2sqr)(const ::knowhere::fp16*, const ::knowhere::fp16*, size_t);
+extern float (*fp16_vec_norm_L2sqr)(const ::knowhere::fp16*, size_t);
 
-extern bool support_pq_fast_scan;
+extern void (*fp16_vec_inner_product_batch_4)(const ::knowhere::fp16*, const ::knowhere::fp16*, const ::knowhere::fp16*,
+                                              const ::knowhere::fp16*, const ::knowhere::fp16*, const size_t, float&,
+                                              float&, float&, float&);
+extern void (*fp16_vec_L2sqr_batch_4)(const ::knowhere::fp16*, const ::knowhere::fp16*, const ::knowhere::fp16*,
+                                      const ::knowhere::fp16*, const ::knowhere::fp16*, const size_t, float&, float&,
+                                      float&, float&);
 
+// bf16
+extern float (*bf16_vec_inner_product)(const ::knowhere::bf16*, const ::knowhere::bf16*, size_t);
+extern float (*bf16_vec_L2sqr)(const ::knowhere::bf16*, const ::knowhere::bf16*, size_t);
+extern float (*bf16_vec_norm_L2sqr)(const ::knowhere::bf16*, size_t);
+
+extern void (*bf16_vec_inner_product_batch_4)(const ::knowhere::bf16*, const ::knowhere::bf16*, const ::knowhere::bf16*,
+                                              const ::knowhere::bf16*, const ::knowhere::bf16*, const size_t, float&,
+                                              float&, float&, float&);
+extern void (*bf16_vec_L2sqr_batch_4)(const ::knowhere::bf16*, const ::knowhere::bf16*, const ::knowhere::bf16*,
+                                      const ::knowhere::bf16*, const ::knowhere::bf16*, const size_t, float&, float&,
+                                      float&, float&);
+// int8
+extern float (*int8_vec_inner_product)(const int8_t*, const int8_t*, size_t);
+extern float (*int8_vec_L2sqr)(const int8_t*, const int8_t*, size_t);
+extern float (*int8_vec_norm_L2sqr)(const int8_t*, size_t);
+
+extern void (*int8_vec_inner_product_batch_4)(const int8_t*, const int8_t*, const int8_t*, const int8_t*, const int8_t*,
+                                              const size_t, float&, float&, float&, float&);
+extern void (*int8_vec_L2sqr_batch_4)(const int8_t*, const int8_t*, const int8_t*, const int8_t*, const int8_t*,
+                                      const size_t, float&, float&, float&, float&);
+
+// rabitq
+extern float (*fvec_masked_sum)(const float*, const uint8_t*, const size_t);
+extern int (*rabitq_dp_popcnt)(const uint8_t*, const uint8_t*, const size_t, const size_t);
+
+// minhash
+extern int (*u64_binary_search_eq)(const uint64_t*, const size_t, const uint64_t);
+extern int (*u64_binary_search_ge)(const uint64_t*, const size_t, const uint64_t);
+extern float (*u32_jaccard_distance)(const char*, const char*, size_t size, size_t);
+extern void (*u32_jaccard_distance_batch_4)(const char*, const char*, const char*, const char*, const char*, size_t,
+                                            size_t, float&, float&, float&, float&);
+extern float (*u64_jaccard_distance)(const char*, const char*, size_t size, size_t);
+extern void (*u64_jaccard_distance_batch_4)(const char*, const char*, const char*, const char*, const char*, size_t,
+                                            size_t, float&, float&, float&, float&);
+extern uint64_t (*calculate_hash)(const char*, size_t);
+extern float (*minhash_lsh_hit)(const char* x, const char* y, size_t dim, size_t mh_lsh_band);
+
+///////////////////////////////////////////////////////////////////////////////
 #if defined(__x86_64__)
 bool
 cpu_support_avx512();
@@ -89,17 +148,25 @@ bool
 cpu_support_avx2();
 bool
 cpu_support_sse4_2();
+bool
+cpu_support_f16c();
 #endif
 
-void
-enable_patch_for_fp32_bf16();
+#if defined(__aarch64__)
+bool
+supports_sve();
+#endif
 
-void
-disable_patch_for_fp32_bf16();
+#if defined(__loongarch__)
+bool
+cpu_support_lasx();
+#endif
 
 void
 fvec_hook(std::string&);
 
+}  // namespace knowhere
+}  // namespace cppcontrib
 }  // namespace faiss
 
 #endif /* HOOK_H */

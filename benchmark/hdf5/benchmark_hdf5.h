@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "benchmark/benchmark_base.h"
+#include "knowhere/operands.h"
 
 /*****************************************************
  * To run this test, please download the HDF5 from
@@ -32,9 +33,8 @@ static const char* HDF5_DATASET_DISTANCES = "distances";
 static const char* HDF5_DATASET_LIMS = "lims";
 static const char* HDF5_DATASET_RADIUS = "radius";
 
-static const char* METRIC_IP_STR = "angular";
 static const char* METRIC_L2_STR = "euclidean";
-static const char* METRIC_COS_STR = "cosine";
+static const char* METRIC_COS_STR = "angular";
 static const char* METRIC_HAM_STR = "hamming";
 static const char* METRIC_JAC_STR = "jaccard";
 
@@ -78,9 +78,9 @@ class Benchmark_hdf5 : public Benchmark_base {
     set_metric_type(const std::string& str) {
         if (str == METRIC_L2_STR || str == "l2") {
             metric_type_ = "L2";
-        } else if (str == METRIC_IP_STR || str == "ip") {
+        } else if (str == "ip") {
             metric_type_ = "IP";
-        } else if (str == METRIC_COS_STR) {
+        } else if (str == METRIC_COS_STR || str == "cosine") {
             metric_type_ = "COSINE";
         } else if (str == METRIC_HAM_STR) {
             metric_type_ = "HAMMING";
@@ -117,7 +117,7 @@ class Benchmark_hdf5 : public Benchmark_base {
         assert("range-multi" == ann_test_name_.substr(pos2 + 1));
     }
 
-    template <bool is_binary>
+    template <typename T>
     void
     load_hdf5_data() {
         const std::string ann_file_name = ann_test_name_ + HDF5_POSTFIX;
@@ -125,35 +125,21 @@ class Benchmark_hdf5 : public Benchmark_base {
 
         printf("[%.3f s] Loading HDF5 file: %s\n", get_time_diff(), ann_file_name.c_str());
 
-        /* load train data */
-        printf("[%.3f s] Loading train data\n", get_time_diff());
-        if (!is_binary) {
+        /* load train & test data */
+        printf("[%.3f s] Loading train & test data\n", get_time_diff());
+        if constexpr (std::is_same_v<T, knowhere::fp32>) {
             xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_FLOAT, dim, nb_);
             assert(dim == dim_ || !"train dataset has incorrect dimension");
-        } else {
-            xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_INTEGER, dim, nb_);
-            assert(dim * 32 == dim_ || !"train dataset has incorrect dimension");
-        }
-
-        // if (metric_str_ == METRIC_IP_STR) {
-        //     printf("[%.3f s] Normalizing train dataset \n", get_time_diff());
-        //     normalize((float*)xb_, nb_, dim_);
-        // }
-
-        /* load test data */
-        printf("[%.3f s] Loading test data\n", get_time_diff());
-        if (!is_binary) {
             xq_ = hdf5_read(ann_file_name, HDF5_DATASET_TEST, H5T_FLOAT, dim, nq_);
             assert(dim == dim_ || !"test dataset has incorrect dimension");
-        } else {
+        } else if constexpr (std::is_same_v<T, knowhere::bin1>) {
+            xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_INTEGER, dim, nb_);
+            assert(dim * 32 == dim_ || !"train dataset has incorrect dimension");
             xq_ = hdf5_read(ann_file_name, HDF5_DATASET_TEST, H5T_INTEGER, dim, nq_);
             assert(dim * 32 == dim_ || !"test dataset has incorrect dimension");
+        } else {
+            assert("unknown data type");
         }
-
-        // if (metric_str_ == METRIC_IP_STR) {
-        //     printf("[%.3f s] Normalizing test dataset \n", get_time_diff());
-        //     normalize((float*)xq_, nq_, dim_);
-        // }
 
         /* load ground-truth data */
         int32_t gt_nq;
@@ -165,7 +151,7 @@ class Benchmark_hdf5 : public Benchmark_base {
         assert(gt_nq == nq_ || !"incorrect nq of ground truth distance");
     }
 
-    template <bool is_binary>
+    template <typename T>
     void
     load_hdf5_data_range() {
         const std::string ann_file_name = ann_test_name_ + HDF5_POSTFIX;
@@ -173,35 +159,21 @@ class Benchmark_hdf5 : public Benchmark_base {
 
         printf("[%.3f s] Loading HDF5 file: %s\n", get_time_diff(), ann_file_name.c_str());
 
-        /* load train data */
-        printf("[%.3f s] Loading train data\n", get_time_diff());
-        if (!is_binary) {
+        /* load train & test data */
+        printf("[%.3f s] Loading train & test data\n", get_time_diff());
+        if constexpr (std::is_same_v<T, knowhere::fp32>) {
             xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_FLOAT, dim, nb_);
             assert(dim == dim_ || !"train dataset has incorrect dimension");
-        } else {
-            xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_INTEGER, dim, nb_);
-            assert(dim * 32 == dim_ || !"train dataset has incorrect dimension");
-        }
-
-        // if (metric_str_ == METRIC_IP_STR) {
-        //     printf("[%.3f s] Normalizing train dataset \n", get_time_diff());
-        //     normalize((float*)xb_, nb_, dim_);
-        // }
-
-        /* load test data */
-        printf("[%.3f s] Loading test data\n", get_time_diff());
-        if (!is_binary) {
             xq_ = hdf5_read(ann_file_name, HDF5_DATASET_TEST, H5T_FLOAT, dim, nq_);
             assert(dim == dim_ || !"test dataset has incorrect dimension");
-        } else {
+        } else if constexpr (std::is_same_v<T, knowhere::bin1>) {
+            xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_INTEGER, dim, nb_);
+            assert(dim * 32 == dim_ || !"train dataset has incorrect dimension");
             xq_ = hdf5_read(ann_file_name, HDF5_DATASET_TEST, H5T_INTEGER, dim, nq_);
             assert(dim * 32 == dim_ || !"test dataset has incorrect dimension");
+        } else {
+            assert("unknown data type");
         }
-
-        // if (metric_str_ == METRIC_IP_STR) {
-        //     printf("[%.3f s] Normalizing test dataset \n", get_time_diff());
-        //     normalize((float*)xq_, nq_, dim_);
-        // }
 
         /* load ground-truth data */
         int32_t cols, rows;
@@ -219,7 +191,7 @@ class Benchmark_hdf5 : public Benchmark_base {
         assert((cols == gt_lims_[nq_] && rows == 1) || !"incorrect dims of ground truth distances");
     }
 
-    template <bool is_binary>
+    template <typename T>
     void
     load_hdf5_data_range_multi() {
         const std::string ann_file_name = ann_test_name_ + HDF5_POSTFIX;
@@ -227,35 +199,21 @@ class Benchmark_hdf5 : public Benchmark_base {
 
         printf("[%.3f s] Loading HDF5 file: %s\n", get_time_diff(), ann_file_name.c_str());
 
-        /* load train data */
-        printf("[%.3f s] Loading train data\n", get_time_diff());
-        if (!is_binary) {
+        /* load train & test data */
+        printf("[%.3f s] Loading train & test data\n", get_time_diff());
+        if constexpr (std::is_same_v<T, knowhere::fp32>) {
             xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_FLOAT, dim, nb_);
             assert(dim == dim_ || !"train dataset has incorrect dimension");
-        } else {
-            xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_INTEGER, dim, nb_);
-            assert(dim * 32 == dim_ || !"train dataset has incorrect dimension");
-        }
-
-        // if (metric_str_ == METRIC_IP_STR) {
-        //     printf("[%.3f s] Normalizing train dataset \n", get_time_diff());
-        //     normalize((float*)xb_, nb_, dim_);
-        // }
-
-        /* load test data */
-        printf("[%.3f s] Loading test data\n", get_time_diff());
-        if (!is_binary) {
             xq_ = hdf5_read(ann_file_name, HDF5_DATASET_TEST, H5T_FLOAT, dim, nq_);
             assert(dim == dim_ || !"test dataset has incorrect dimension");
-        } else {
+        } else if constexpr (std::is_same_v<T, knowhere::bin1>) {
+            xb_ = hdf5_read(ann_file_name, HDF5_DATASET_TRAIN, H5T_INTEGER, dim, nb_);
+            assert(dim * 32 == dim_ || !"train dataset has incorrect dimension");
             xq_ = hdf5_read(ann_file_name, HDF5_DATASET_TEST, H5T_INTEGER, dim, nq_);
             assert(dim * 32 == dim_ || !"test dataset has incorrect dimension");
+        } else {
+            assert("unknown data type");
         }
-
-        // if (metric_str_ == METRIC_IP_STR) {
-        //     printf("[%.3f s] Normalizing test dataset \n", get_time_diff());
-        //     normalize((float*)xq_, nq_, dim_);
-        // }
 
         /* load ground-truth data */
         int32_t cols, rows;
@@ -355,31 +313,30 @@ class Benchmark_hdf5 : public Benchmark_base {
         auto dataspace = H5Screate_simple(2, dims, NULL);
         auto dataset = H5Dcreate2(file, dataset_name, type_id, dataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
         auto err = H5Dwrite(dataset, type_id, H5S_ALL, H5S_ALL, H5P_DEFAULT, data);
-        assert(err == 0);
+        if (err != 0) {
+            std::abort();
+        }
         H5Dclose(dataset);
         H5Sclose(dataspace);
     }
 
     // For binary vector, dim should be divided by 32, since we use int32 to store binary vector data */
-    template <bool is_binary>
+    template <typename T>
     void
     hdf5_write(const char* file_name, const int32_t dim, const int32_t k, const void* xb, const int32_t nb,
                const void* xq, const int32_t nq, const void* g_ids, const void* g_dist) {
         /* Open the file and the dataset. */
         hid_t file = H5Fcreate(file_name, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
 
-        /* write train dataset */
-        if (!is_binary) {
+        /* write train & test dataset */
+        if constexpr (std::is_same_v<T, knowhere::fp32>) {
             write_hdf5_dataset(file, HDF5_DATASET_TRAIN, H5T_NATIVE_FLOAT, nb, dim, xb);
-        } else {
-            write_hdf5_dataset(file, HDF5_DATASET_TRAIN, H5T_NATIVE_INT32, nb, dim / 32, xb);
-        }
-
-        /* write test dataset */
-        if (!is_binary) {
             write_hdf5_dataset(file, HDF5_DATASET_TEST, H5T_NATIVE_FLOAT, nq, dim, xq);
-        } else {
+        } else if constexpr (std::is_same_v<T, knowhere::bin1>) {
+            write_hdf5_dataset(file, HDF5_DATASET_TRAIN, H5T_NATIVE_INT32, nb, dim / 32, xb);
             write_hdf5_dataset(file, HDF5_DATASET_TEST, H5T_NATIVE_INT32, nq, dim / 32, xq);
+        } else {
+            assert("unknown data type");
         }
 
         /* write ground-truth labels dataset */
@@ -398,25 +355,22 @@ class Benchmark_hdf5 : public Benchmark_base {
     //    HDF5_DATASET_LIMS      - H5T_NATIVE_INT32, [1, nq+1]
     //    HDF5_DATASET_NEIGHBORS - H5T_NATIVE_INT32, [1, lims[nq]]
     //    HDF5_DATASET_DISTANCES - H5T_NATIVE_FLOAT, [1, lims[nq]]
-    template <bool is_binary>
+    template <typename T>
     void
     hdf5_write_range(const char* file_name, const int32_t dim, const void* xb, const int32_t nb, const void* xq,
                      const int32_t nq, const float radius, const void* g_lims, const void* g_ids, const void* g_dist) {
         /* Open the file and the dataset. */
         hid_t file = H5Fcreate(file_name, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
 
-        /* write train dataset */
-        if (!is_binary) {
+        /* write train & test dataset */
+        if constexpr (std::is_same_v<T, knowhere::fp32>) {
             write_hdf5_dataset(file, HDF5_DATASET_TRAIN, H5T_NATIVE_FLOAT, nb, dim, xb);
-        } else {
-            write_hdf5_dataset(file, HDF5_DATASET_TRAIN, H5T_NATIVE_INT32, nb, dim / 32, xb);
-        }
-
-        /* write test dataset */
-        if (!is_binary) {
             write_hdf5_dataset(file, HDF5_DATASET_TEST, H5T_NATIVE_FLOAT, nq, dim, xq);
-        } else {
+        } else if constexpr (std::is_same_v<T, knowhere::bin1>) {
+            write_hdf5_dataset(file, HDF5_DATASET_TRAIN, H5T_NATIVE_INT32, nb, dim / 32, xb);
             write_hdf5_dataset(file, HDF5_DATASET_TEST, H5T_NATIVE_INT32, nq, dim / 32, xq);
+        } else {
+            assert("unknown data type");
         }
 
         /* write ground-truth radius */

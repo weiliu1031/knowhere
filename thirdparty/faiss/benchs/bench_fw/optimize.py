@@ -7,14 +7,14 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
-import faiss  # @manual=//faiss/python:pyfaiss_gpu
+import faiss  # @manual=//faiss/python:pyfaiss
 
-# from faiss.contrib.evaluation import (  # @manual=//faiss/contrib:faiss_contrib_gpu
+# from faiss.contrib.evaluation import (  # @manual=//faiss/contrib:faiss_contrib  # noqa: E501
 #     OperatingPoints,
 # )
 
 from .benchmark import Benchmark
-from .descriptors import DatasetDescriptor, IndexDescriptor
+from .descriptors import DatasetDescriptor, IndexDescriptorClassic
 from .utils import dict_merge, filter_results, ParetoMetric, ParetoMode
 
 logger = logging.getLogger(__name__)
@@ -70,15 +70,15 @@ class Optimizer:
             evaluation="knn",
             accuracy_metric="knn_intersection",
             min_accuracy=min_accuracy,
-            name_filter=None
-            if include_flat
-            else (lambda n: not n.startswith("Flat")),
+            name_filter=(
+                None if include_flat else (lambda n: not n.startswith("Flat"))
+            ),
             pareto_mode=ParetoMode.GLOBAL,
             pareto_metric=pareto_metric,
         )
         assert filtered
         index_descs = [
-            IndexDescriptor(
+            IndexDescriptorClassic(
                 factory=v["factory"],
                 construction_params=v["construction_params"],
                 search_params=v["search_params"],
@@ -103,8 +103,10 @@ class Optimizer:
                 dry_run=False,
             )
 
-            descs = [IndexDescriptor(factory="Flat"),] + [
-                IndexDescriptor(
+            descs = [
+                IndexDescriptorClassic(factory="Flat"),
+            ] + [
+                IndexDescriptorClassic(
                     factory="HNSW32",
                     construction_params=[{"efConstruction": 2**i}],
                 )
@@ -131,7 +133,7 @@ class Optimizer:
         training_vectors: DatasetDescriptor,
         database_vectors: DatasetDescriptor,
         query_vectors: DatasetDescriptor,
-        quantizers: Dict[int, List[IndexDescriptor]],
+        quantizers: Dict[int, List[IndexDescriptorClassic]],
         codecs: List[Tuple[str, str]],
         min_accuracy: float,
     ):
@@ -159,8 +161,11 @@ class Optimizer:
                                 quantizer_desc.search_params,
                             )
                     ivf_descs.append(
-                        IndexDescriptor(
-                            factory=f"{pretransform}IVF{nlist}({quantizer_desc.factory}),{fine_ivf}",
+                        IndexDescriptorClassic(
+                            factory=(
+                                f"{pretransform}IVF{nlist}"
+                                f"({quantizer_desc.factory}),{fine_ivf}"
+                            ),
                             construction_params=construction_params,
                         )
                     )
@@ -188,7 +193,7 @@ class Optimizer:
     ):
         _, results = self.benchmark_and_filter_candidates(
             index_descs=[
-                IndexDescriptor(factory=f"IVF{nlist}(Flat),Flat"),
+                IndexDescriptorClassic(factory=f"IVF{nlist}(Flat),Flat"),
             ],
             training_vectors=training_vectors,
             database_vectors=database_vectors,
@@ -226,8 +231,11 @@ class Optimizer:
             [
                 (None, "Flat"),
                 (None, "SQfp16"),
+                (None, "SQbf16"),
                 (None, "SQ8"),
-            ] + [
+                (None, "SQ8_direct_signed"),
+            ]
+            + [
                 (f"OPQ{M}_{M * dim}", f"PQ{M}x{b}")
                 for M in [8, 12, 16, 32, 48, 64, 96, 128, 192, 256]
                 if d % M == 0
@@ -235,7 +243,8 @@ class Optimizer:
                 if M * dim <= d
                 for b in range(4, 14, 2)
                 if M * b < d * 8  # smaller than SQ8
-            ] + [
+            ]
+            + [
                 (None, f"PQ{M}x{b}")
                 for M in [8, 12, 16, 32, 48, 64, 96, 128, 192, 256]
                 if d % M == 0
@@ -254,10 +263,12 @@ class Optimizer:
 
         _, filtered = self.benchmark_and_filter_candidates(
             index_descs=[
-                IndexDescriptor(
-                    factory=f"IVF{nlist},{pq}"
-                    if opq is None
-                    else f"{opq},IVF{nlist},{pq}",
+                IndexDescriptorClassic(
+                    factory=(
+                        f"IVF{nlist},{pq}"
+                        if opq is None
+                        else f"{opq},IVF{nlist},{pq}"
+                    ),
                     search_params={
                         "nprobe": nprobe,
                     },
@@ -273,7 +284,7 @@ class Optimizer:
             pareto_metric=ParetoMetric.TIME_SPACE,
         )
         results = [
-            factory[r] for r in set(v["factory"] for _, _, _, k, v in filtered)
+            factory[r] for r in {v["factory"] for _, _, _, k, v in filtered}
         ]
         return results
 

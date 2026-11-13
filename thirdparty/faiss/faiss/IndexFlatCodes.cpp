@@ -1,5 +1,5 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -7,16 +7,21 @@
 
 #include <faiss/IndexFlatCodes.h>
 
+#include <atomic>
+
 #include <faiss/impl/AuxIndexStructures.h>
 #include <faiss/impl/CodePacker.h>
 #include <faiss/impl/DistanceComputer.h>
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/IDSelector.h>
+#include <faiss/impl/ResultHandler.h>
+#include <faiss/utils/distances_dispatch.h>
+#include <faiss/utils/extra_distances.h>
 
 namespace faiss {
 
-IndexFlatCodes::IndexFlatCodes(size_t code_size, idx_t d, MetricType metric)
-        : Index(d, metric), code_size(code_size) {}
+IndexFlatCodes::IndexFlatCodes(size_t code_size_, idx_t d_, MetricType metric)
+        : Index(d_, metric), code_size(code_size_) {}
 
 IndexFlatCodes::IndexFlatCodes() : code_size(0) {}
 
@@ -27,6 +32,15 @@ void IndexFlatCodes::add(idx_t n, const float* x) {
     }
     codes.resize((ntotal + n) * code_size);
     sa_encode(n, x, codes.data() + (ntotal * code_size));
+    ntotal += n;
+}
+
+void IndexFlatCodes::add_sa_codes(
+        idx_t n,
+        const uint8_t* codes_in,
+        const idx_t* /* xids */) {
+    codes.resize((ntotal + n) * code_size);
+    memcpy(codes.data() + (ntotal * code_size), codes_in, n * code_size);
     ntotal += n;
 }
 
@@ -70,11 +84,6 @@ void IndexFlatCodes::reconstruct(idx_t key, float* recons) const {
     reconstruct_n(key, 1, recons);
 }
 
-FlatCodesDistanceComputer* IndexFlatCodes::get_FlatCodesDistanceComputer()
-        const {
-    FAISS_THROW_MSG("not implemented");
-}
-
 void IndexFlatCodes::check_compatible_for_merge(const Index& otherIndex) const {
     // minimal sanity checks
     const IndexFlatCodes* other =
@@ -104,7 +113,7 @@ CodePacker* IndexFlatCodes::get_CodePacker() const {
 }
 
 void IndexFlatCodes::permute_entries(const idx_t* perm) {
-    std::vector<uint8_t> new_codes(codes.size());
+    MaybeOwnedVector<uint8_t> new_codes(codes.size());
 
     for (idx_t i = 0; i < ntotal; i++) {
         memcpy(new_codes.data() + i * code_size,
@@ -112,6 +121,207 @@ void IndexFlatCodes::permute_entries(const idx_t* perm) {
                code_size);
     }
     std::swap(codes, new_codes);
+}
+
+namespace {
+
+template <class VD>
+struct GenericFlatCodesDistanceComputer : FlatCodesDistanceComputer {
+    const IndexFlatCodes& codec;
+    const VD vd;
+    // temp buffers
+    std::vector<uint8_t> code_buffer;
+    std::vector<float> vec_buffer;
+    const float* query = nullptr;
+
+    GenericFlatCodesDistanceComputer(
+            const IndexFlatCodes* codec_,
+            const VD& vd_)
+            : FlatCodesDistanceComputer(
+                      codec_->codes.data(),
+                      codec_->code_size),
+              codec(*codec_),
+              vd(vd_),
+              code_buffer(codec_->code_size * 4),
+              vec_buffer(codec_->d * 4) {}
+
+    void set_query(const float* x) override {
+        query = x;
+    }
+
+    float operator()(idx_t i) override {
+        codec.sa_decode(1, codes + i * code_size, vec_buffer.data());
+        return vd(query, vec_buffer.data());
+    }
+
+    float distance_to_code(const uint8_t* code) override {
+        codec.sa_decode(1, code, vec_buffer.data());
+        return vd(query, vec_buffer.data());
+    }
+
+    float symmetric_dis(idx_t i, idx_t j) override {
+        codec.sa_decode(1, codes + i * code_size, vec_buffer.data());
+        codec.sa_decode(1, codes + j * code_size, vec_buffer.data() + vd.d);
+        return vd(vec_buffer.data(), vec_buffer.data() + vd.d);
+    }
+
+    void distances_batch_4(
+            const idx_t idx0,
+            const idx_t idx1,
+            const idx_t idx2,
+            const idx_t idx3,
+            float& dis0,
+            float& dis1,
+            float& dis2,
+            float& dis3) override {
+        uint8_t* cp = code_buffer.data();
+        for (idx_t i : {idx0, idx1, idx2, idx3}) {
+            memcpy(cp, codes + i * code_size, code_size);
+            cp += code_size;
+        }
+        // potential benefit is if batch decoding is more efficient than 1 by 1
+        // decoding
+        codec.sa_decode(4, code_buffer.data(), vec_buffer.data());
+        dis0 = vd(query, vec_buffer.data());
+        dis1 = vd(query, vec_buffer.data() + vd.d);
+        dis2 = vd(query, vec_buffer.data() + 2 * vd.d);
+        dis3 = vd(query, vec_buffer.data() + 3 * vd.d);
+    }
+};
+
+template <class BlockResultHandler>
+struct Run_search_with_decompress {
+    using T = void;
+
+    template <class VectorDistance>
+    void f(VectorDistance& vd,
+           const IndexFlatCodes* index_ptr,
+           const float* xq,
+           BlockResultHandler& res) {
+        // Note that there seems to be a clang (?) bug that "sometimes" passes
+        // the const Index & parameters by value, so to be on the safe side,
+        // it's better to use pointers.
+        const IndexFlatCodes& index = *index_ptr;
+        size_t ntotal = index.ntotal;
+        using SingleResultHandler =
+                typename BlockResultHandler::SingleResultHandler;
+        using DC = GenericFlatCodesDistanceComputer<VectorDistance>;
+        std::exception_ptr ex;
+        std::atomic<bool> interrupt{false};
+#pragma omp parallel // if (res.nq > 100)
+        {
+            std::unique_ptr<DC> dc;
+            std::unique_ptr<SingleResultHandler> resi;
+            try {
+                dc = std::make_unique<DC>(&index, vd);
+                resi = std::make_unique<SingleResultHandler>(res);
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+#pragma omp for
+            for (int64_t q = 0; q < static_cast<int64_t>(res.nq); q++) {
+                if (interrupt.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                try {
+                    resi->begin(q);
+                    dc->set_query(xq + vd.d * q);
+                    for (size_t i = 0; i < ntotal; i++) {
+                        if (res.is_in_selection(i)) {
+                            float dis = (*dc)(i);
+                            resi->add_result(dis, i);
+                        }
+                    }
+                    resi->end();
+                } catch (...) {
+                    omp_capture_exception(ex, [&] { interrupt = true; });
+                }
+            }
+        }
+        omp_rethrow_if_exception(ex);
+    }
+};
+
+struct Run_search_with_decompress_res {
+    using T = void;
+
+    template <class BlockResultHandler>
+    void f(BlockResultHandler& res,
+           const IndexFlatCodes* index,
+           const float* xq) {
+        with_VectorDistance(
+                index->d, index->metric_type, index->metric_arg, [&](auto vd) {
+                    Run_search_with_decompress<BlockResultHandler> r;
+                    r.template f<decltype(vd)>(vd, index, xq, res);
+                });
+    }
+};
+
+} // anonymous namespace
+
+FlatCodesDistanceComputer* IndexFlatCodes::get_FlatCodesDistanceComputer()
+        const {
+    return with_VectorDistance(
+            d,
+            metric_type,
+            metric_arg,
+            [&](auto vd) -> FlatCodesDistanceComputer* {
+                return new GenericFlatCodesDistanceComputer<decltype(vd)>(
+                        this, vd);
+            });
+}
+
+void IndexFlatCodes::search(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        float* distances,
+        idx_t* labels,
+        const SearchParameters* params) const {
+    Run_search_with_decompress_res r;
+    const IDSelector* sel = params ? params->sel : nullptr;
+    dispatch_knn_ResultHandler(
+            n, distances, labels, k, metric_type, sel, r, this, x);
+}
+
+void IndexFlatCodes::range_search(
+        idx_t /* n */,
+        const float* x,
+        float radius,
+        RangeSearchResult* result,
+        const SearchParameters* params) const {
+    const IDSelector* sel = params ? params->sel : nullptr;
+    Run_search_with_decompress_res r;
+    dispatch_range_ResultHandler(result, radius, metric_type, sel, r, this, x);
+}
+
+void IndexFlatCodes::search1(
+        const float* x,
+        ResultHandler& handler,
+        SearchParameters* params) const {
+    const IDSelector* sel = params ? params->sel : nullptr;
+    Run_search_with_decompress_res r;
+    if (sel) {
+        if (is_similarity_metric(metric_type)) {
+            SingleQueryBlockResultHandler<CMin<float, idx_t>, true> res(
+                    handler, sel);
+            r.f(res, this, x);
+        } else {
+            SingleQueryBlockResultHandler<CMax<float, idx_t>, true> res(
+                    handler, sel);
+            r.f(res, this, x);
+        }
+    } else {
+        if (is_similarity_metric(metric_type)) {
+            SingleQueryBlockResultHandler<CMin<float, idx_t>, false> res(
+                    handler);
+            r.f(res, this, x);
+        } else {
+            SingleQueryBlockResultHandler<CMax<float, idx_t>, false> res(
+                    handler);
+            r.f(res, this, x);
+        }
+    }
 }
 
 } // namespace faiss

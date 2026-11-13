@@ -23,25 +23,48 @@ class IndexNodeThreadPoolWrapper : public IndexNode {
 
     IndexNodeThreadPoolWrapper(std::unique_ptr<IndexNode> index_node, std::shared_ptr<ThreadPool> thread_pool);
 
-    Status
-    Train(const DataSet& dataset, const Config& cfg) override {
-        return index_node_->Train(dataset, cfg);
+    BuildInputOptions
+    GetBuildInputOptions() const override {
+        return index_node_->GetBuildInputOptions();
+    }
+
+    expected<bool>
+    TryReserveBuild(const DataSetPtr dataset, std::shared_ptr<Config> cfg) override {
+        return index_node_->TryReserveBuild(dataset, std::move(cfg));
+    }
+
+    void
+    ReleaseBuildReservation() noexcept override {
+        index_node_->ReleaseBuildReservation();
     }
 
     Status
-    Add(const DataSet& dataset, const Config& cfg) override {
-        return index_node_->Add(dataset, cfg);
+    Train(const DataSetPtr dataset, std::shared_ptr<Config> cfg, bool use_knowhere_build_pool) override {
+        return index_node_->Train(dataset, std::move(cfg), use_knowhere_build_pool);
+    }
+
+    Status
+    Add(const DataSetPtr dataset, std::shared_ptr<Config> cfg, bool use_knowhere_build_pool) override {
+        return index_node_->Add(dataset, std::move(cfg), use_knowhere_build_pool);
     }
 
     expected<DataSetPtr>
-    Search(const DataSet& dataset, const Config& cfg, const BitsetView& bitset) const override;
+    Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+           milvus::OpContext* op_context) const override;
 
     expected<DataSetPtr>
-    RangeSearch(const DataSet& dataset, const Config& cfg, const BitsetView& bitset) const override;
+    RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+                milvus::OpContext* op_context) const override;
 
     expected<DataSetPtr>
-    GetVectorByIds(const DataSet& dataset) const override {
-        return index_node_->GetVectorByIds(dataset);
+    GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const override {
+        return index_node_->GetVectorByIds(dataset, op_context);
+    }
+
+    expected<DataSetPtr>
+    GetEmbListByIds(const DataSetPtr dataset, const std::string& metric_type,
+                    milvus::OpContext* op_context) const override {
+        return index_node_->GetEmbListByIds(dataset, metric_type, op_context);
     }
 
     bool
@@ -49,9 +72,14 @@ class IndexNodeThreadPoolWrapper : public IndexNode {
         return index_node_->HasRawData(metric_type);
     }
 
+    bool
+    IsIndexRefineEnabled() const override {
+        return index_node_->IsIndexRefineEnabled();
+    }
+
     expected<DataSetPtr>
-    GetIndexMeta(const Config& cfg) const override {
-        return index_node_->GetIndexMeta(cfg);
+    GetIndexMeta(std::unique_ptr<Config> cfg) const override {
+        return index_node_->GetIndexMeta(std::move(cfg));
     }
 
     Status
@@ -59,14 +87,19 @@ class IndexNodeThreadPoolWrapper : public IndexNode {
         return index_node_->Serialize(binset);
     }
 
-    Status
-    Deserialize(const BinarySet& binset, const Config& config) override {
-        return index_node_->Deserialize(binset, config);
+    expected<LoadRequirements>
+    InspectLoadRequirements(const BinarySet& binset, std::shared_ptr<Config> cfg) override {
+        return index_node_->InspectLoadRequirements(binset, std::move(cfg));
     }
 
     Status
-    DeserializeFromFile(const std::string& filename, const Config& config) override {
-        return index_node_->DeserializeFromFile(filename, config);
+    Deserialize(const BinarySet& binset, std::shared_ptr<Config> cfg) override {
+        return index_node_->Deserialize(binset, std::move(cfg));
+    }
+
+    Status
+    DeserializeFromFile(const std::string& filename, std::shared_ptr<Config> cfg) override {
+        return index_node_->DeserializeFromFile(filename, move(cfg));
     }
 
     std::unique_ptr<BaseConfig>
@@ -87,6 +120,46 @@ class IndexNodeThreadPoolWrapper : public IndexNode {
     int64_t
     Count() const override {
         return index_node_->Count();
+    }
+
+    bool
+    NeedBitsetExactCount() const override {
+        return index_node_->NeedBitsetExactCount();
+    }
+
+    IdMap&
+    GetIdMap() override {
+        return index_node_->GetIdMap();
+    }
+
+    const IdMap&
+    GetIdMap() const override {
+        return index_node_->GetIdMap();
+    }
+
+    void
+    SetIdMapType(IdMap::Type type) override {
+        index_node_->SetIdMapType(type);
+    }
+
+    int64_t
+    MapOutToIn(int64_t out_id) const override {
+        return index_node_->MapOutToIn(out_id);
+    }
+
+    Status
+    CompactOutToIn(const int64_t* out_ids, size_t count, std::vector<int64_t>& compact_ids) const override {
+        return index_node_->CompactOutToIn(out_ids, count, compact_ids);
+    }
+
+    expected<PreparedBitset>
+    PrepareBitset(BitsetView bitset) const override {
+        return index_node_->PrepareBitset(bitset);
+    }
+
+    Status
+    FinalizeIdMap() override {
+        return index_node_->FinalizeIdMap();
     }
 
     std::string

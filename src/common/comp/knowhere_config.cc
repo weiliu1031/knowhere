@@ -13,23 +13,32 @@
 
 #include <string>
 
+#ifdef KNOWHERE_WITH_CARDINAL
+#include "cardinal/thread/fetch_thread_pool.h"
+#endif
 #ifdef KNOWHERE_WITH_DISKANN
 #include "diskann/aio_context_pool.h"
 #endif
-#include "faiss/Clustering.h"
-#include "faiss/utils/distances.h"
-#include "knowhere/comp/thread_pool.h"
+#include "faiss/cppcontrib/knowhere/utils/distances.h"
 #include "knowhere/log.h"
+#include "knowhere/thread_pool.h"
 #ifdef KNOWHERE_WITH_GPU
 #include "index/gpu/gpu_res_mgr.h"
 #endif
-#ifdef KNOWHERE_WITH_RAFT
-#include "common/raft/integration/raft_initialization.hpp"
+#ifdef KNOWHERE_WITH_CUVS
+#include "common/cuvs/integration/raft_initialization.hpp"
 #include "cuda_runtime_api.h"
 #endif
+#include <faiss/utils/simd_levels.h>
+
 #include "simd/hook.h"
 
 namespace knowhere {
+
+namespace {
+static KnowhereConfig::ClusteringType g_clustering_type = KnowhereConfig::ClusteringType::K_MEANS;
+static double g_early_stop_threshold = 0.0;
+}  // namespace
 
 void
 KnowhereConfig::ShowVersion() {
@@ -40,7 +49,7 @@ KnowhereConfig::ShowVersion() {
 
 #ifdef KNOWHERE_VERSION
     msg = msg + XSTR(KNOWHERE_VERSION);
-#ifdef KNOWHERE_WITH_RAFT
+#ifdef KNOWHERE_WITH_CUVS
     msg = msg + "-gpu";
 #endif
 #else
@@ -57,91 +66,90 @@ KnowhereConfig::ShowVersion() {
 std::string
 KnowhereConfig::SetSimdType(const SimdType simd_type) {
 #ifdef __x86_64__
+    faiss::cppcontrib::knowhere::use_simd_auto = (simd_type == SimdType::AUTO);
     if (simd_type == SimdType::AUTO) {
-        faiss::use_avx512 = true;
-        faiss::use_avx2 = true;
-        faiss::use_sse4_2 = true;
+        faiss::cppcontrib::knowhere::use_avx512 = true;
+        faiss::cppcontrib::knowhere::use_avx2 = true;
+        faiss::cppcontrib::knowhere::use_sse4_2 = true;
         LOG_KNOWHERE_INFO_ << "FAISS expect simdType::AUTO";
     } else if (simd_type == SimdType::AVX512) {
-        faiss::use_avx512 = true;
-        faiss::use_avx2 = true;
-        faiss::use_sse4_2 = true;
+        faiss::cppcontrib::knowhere::use_avx512 = true;
+        faiss::cppcontrib::knowhere::use_avx2 = true;
+        faiss::cppcontrib::knowhere::use_sse4_2 = true;
         LOG_KNOWHERE_INFO_ << "FAISS expect simdType::AVX512";
     } else if (simd_type == SimdType::AVX2) {
-        faiss::use_avx512 = false;
-        faiss::use_avx2 = true;
-        faiss::use_sse4_2 = true;
+        faiss::cppcontrib::knowhere::use_avx512 = false;
+        faiss::cppcontrib::knowhere::use_avx2 = true;
+        faiss::cppcontrib::knowhere::use_sse4_2 = true;
         LOG_KNOWHERE_INFO_ << "FAISS expect simdType::AVX2";
     } else if (simd_type == SimdType::SSE4_2) {
-        faiss::use_avx512 = false;
-        faiss::use_avx2 = false;
-        faiss::use_sse4_2 = true;
+        faiss::cppcontrib::knowhere::use_avx512 = false;
+        faiss::cppcontrib::knowhere::use_avx2 = false;
+        faiss::cppcontrib::knowhere::use_sse4_2 = true;
         LOG_KNOWHERE_INFO_ << "FAISS expect simdType::SSE4_2";
     } else if (simd_type == SimdType::GENERIC) {
-        faiss::use_avx512 = false;
-        faiss::use_avx2 = false;
-        faiss::use_sse4_2 = false;
+        faiss::cppcontrib::knowhere::use_avx512 = false;
+        faiss::cppcontrib::knowhere::use_avx2 = false;
+        faiss::cppcontrib::knowhere::use_sse4_2 = false;
         LOG_KNOWHERE_INFO_ << "FAISS expect simdType::GENERIC";
     }
 #endif
     std::string simd_str;
-    faiss::fvec_hook(simd_str);
+    faiss::cppcontrib::knowhere::fvec_hook(simd_str);
     LOG_KNOWHERE_INFO_ << "FAISS hook " << simd_str;
+    LOG_KNOWHERE_INFO_ << "FAISS DD level set to " << faiss::SIMDConfig::get_level_name();
+
     return simd_str;
 }
 
 void
 KnowhereConfig::EnablePatchForComputeFP32AsBF16() {
-    LOG_KNOWHERE_INFO_ << "Enable patch for compute fp32 as bf16";
-    faiss::enable_patch_for_fp32_bf16();
 }
 
 void
 KnowhereConfig::DisablePatchForComputeFP32AsBF16() {
-    LOG_KNOWHERE_INFO_ << "Disable patch for compute fp32 as bf16";
-    faiss::disable_patch_for_fp32_bf16();
 }
 
 void
 KnowhereConfig::SetBlasThreshold(const int64_t use_blas_threshold) {
     LOG_KNOWHERE_INFO_ << "Set faiss::distance_compute_blas_threshold to " << use_blas_threshold;
-    faiss::distance_compute_blas_threshold = static_cast<int>(use_blas_threshold);
+    faiss::cppcontrib::knowhere::distance_compute_blas_threshold = static_cast<int>(use_blas_threshold);
 }
 
 int64_t
 KnowhereConfig::GetBlasThreshold() {
-    return faiss::distance_compute_blas_threshold;
+    return faiss::cppcontrib::knowhere::distance_compute_blas_threshold;
 }
 
 void
 KnowhereConfig::SetEarlyStopThreshold(const double early_stop_threshold) {
-    LOG_KNOWHERE_INFO_ << "Set faiss::early_stop_threshold to " << early_stop_threshold;
-    faiss::early_stop_threshold = early_stop_threshold;
+    LOG_KNOWHERE_INFO_ << "Set early_stop_threshold to " << early_stop_threshold;
+    g_early_stop_threshold = early_stop_threshold;
 }
 
 double
 KnowhereConfig::GetEarlyStopThreshold() {
-    return faiss::early_stop_threshold;
+    return g_early_stop_threshold;
 }
 
 void
 KnowhereConfig::SetClusteringType(const ClusteringType clustering_type) {
-    LOG_KNOWHERE_INFO_ << "Set faiss::clustering_type to " << clustering_type;
-    switch (clustering_type) {
-        case ClusteringType::K_MEANS:
-        default:
-            faiss::clustering_type = faiss::ClusteringType::K_MEANS;
-            break;
-        case ClusteringType::K_MEANS_PLUS_PLUS:
-            faiss::clustering_type = faiss::ClusteringType::K_MEANS_PLUS_PLUS;
-            break;
-    }
+    LOG_KNOWHERE_INFO_ << "Set clustering_type to " << clustering_type;
+    g_clustering_type = clustering_type;
+}
+
+KnowhereConfig::ClusteringType
+KnowhereConfig::GetClusteringType() {
+    return g_clustering_type;
 }
 
 bool
 KnowhereConfig::SetAioContextPool(size_t num_ctx) {
 #ifdef KNOWHERE_WITH_DISKANN
-    return AioContextPool::InitGlobalAioPool(num_ctx, default_max_events);
+    size_t max_events = (num_ctx > 0) ? std::min(default_max_nr / num_ctx, default_max_events) : default_max_events;
+    LOG_KNOWHERE_INFO_ << "InitGlobalAioPool with " << num_ctx << " contexts and " << max_events
+                       << " events per context";
+    return AioContextPool::InitGlobalAioPool(num_ctx, max_events);
 #endif
     return true;
 }
@@ -151,9 +159,34 @@ KnowhereConfig::SetBuildThreadPoolSize(size_t num_threads) {
     knowhere::ThreadPool::SetGlobalBuildThreadPoolSize(num_threads);
 }
 
+size_t
+KnowhereConfig::GetBuildThreadPoolSize() {
+    return knowhere::ThreadPool::GetGlobalBuildThreadPoolSize();
+}
+
 void
 KnowhereConfig::SetSearchThreadPoolSize(size_t num_threads) {
     knowhere::ThreadPool::SetGlobalSearchThreadPoolSize(num_threads);
+}
+
+size_t
+KnowhereConfig::GetSearchThreadPoolSize() {
+    return knowhere::ThreadPool::GetGlobalSearchThreadPoolSize();
+}
+
+void
+KnowhereConfig::SetFetchThreadPoolSize(size_t num_threads) {
+#ifdef KNOWHERE_WITH_CARDINAL
+    // Keep Cardinal's shared loading-overhead policies in sync with the pool.
+    cardinalv2::SetFetchThreadPoolSize(num_threads);
+#else
+    knowhere::ThreadPool::SetGlobalFetchThreadPoolSize(num_threads);
+#endif
+}
+
+size_t
+KnowhereConfig::GetFetchThreadPoolSize() {
+    return knowhere::ThreadPool::GetGlobalFetchThreadPoolSize();
 }
 
 void
@@ -177,7 +210,7 @@ KnowhereConfig::FreeGPUResource() {
 
 void
 KnowhereConfig::SetRaftMemPool(size_t init_size, size_t max_size) {
-#ifdef KNOWHERE_WITH_RAFT
+#ifdef KNOWHERE_WITH_CUVS
     int count = 0;
     auto status = cudaGetDeviceCount(&count);
     if (status != cudaSuccess) {
@@ -189,21 +222,31 @@ KnowhereConfig::SetRaftMemPool(size_t init_size, size_t max_size) {
         return;
     }
 
-    auto config = raft_knowhere::raft_configuration{};
+    auto config = cuvs_knowhere::raft_configuration{};
     config.init_mem_pool_size_mb = init_size;
     config.max_mem_pool_size_mb = max_size;
     // This should probably be a separate configuration option, but fine for now
     config.max_workspace_size_mb = max_size;
-    raft_knowhere::initialize_raft(config);
+    cuvs_knowhere::initialize_raft(config);
 #endif
 }
-
 void
 KnowhereConfig::SetRaftMemPool() {
     // Overload for default values
-#ifdef KNOWHERE_WITH_RAFT
-    auto config = raft_knowhere::raft_configuration{};
-    raft_knowhere::initialize_raft(config);
+#ifdef KNOWHERE_WITH_CUVS
+    int count = 0;
+    auto status = cudaGetDeviceCount(&count);
+    if (status != cudaSuccess) {
+        LOG_KNOWHERE_INFO_ << cudaGetErrorString(status);
+        return;
+    }
+    if (count < 1) {
+        LOG_KNOWHERE_INFO_ << "GPU not available";
+        return;
+    }
+
+    auto config = cuvs_knowhere::raft_configuration{};
+    cuvs_knowhere::initialize_raft(config);
 #endif
 }
 

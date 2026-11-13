@@ -1,5 +1,5 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -26,7 +26,7 @@ void DirectMap::set_type(
         const InvertedLists* invlists,
         size_t ntotal) {
     FAISS_THROW_IF_NOT(
-            new_type == NoMap || new_type == Array || new_type == ConcurrentArray || new_type == Hashtable);
+            new_type == NoMap || new_type == Array || new_type == Hashtable);
 
     if (new_type == type) {
         // nothing to do
@@ -41,36 +41,25 @@ void DirectMap::set_type(
         return;
     } else if (new_type == Array) {
         array.resize(ntotal, -1);
-    } else if (new_type == ConcurrentArray) {
-        concurrentArray.resize(ntotal, -1);
     } else if (new_type == Hashtable) {
         hashtable.reserve(ntotal);
     }
 
     for (size_t key = 0; key < invlists->nlist; key++) {
-        size_t segment_num = invlists->get_segment_num(key);
-        for (size_t segment_idx = 0; segment_idx < segment_num; segment_idx++) {
-            size_t segment_size = invlists->get_segment_size(key, segment_idx);
-            size_t segment_offset = invlists->get_segment_offset(key, segment_idx);
-            InvertedLists::ScopedIds idlist(invlists, key, segment_offset);
-            if (new_type == Array) {
-                for (long ofs = 0; ofs < segment_size; ofs++) {
-                    FAISS_THROW_IF_NOT_MSG(
-                            0 <= idlist[ofs] && idlist[ofs] < ntotal,
-                            "direct map supported only for seuquential ids");
-                    array[idlist[ofs]] = lo_build(key, segment_offset + ofs);
-                }
-            } else if (new_type == ConcurrentArray) {
-                for (long ofs = 0; ofs < segment_size; ofs++) {
-                    FAISS_THROW_IF_NOT_MSG(
-                            0 <= idlist[ofs] && idlist[ofs] < ntotal,
-                            "direct map supported only for seuquential ids");
-                    concurrentArray[idlist[ofs]] = lo_build(key, segment_offset + ofs);
-                }
-            } else if (new_type == Hashtable) {
-                for (long ofs = 0; ofs < segment_size; ofs++) {
-                    hashtable[idlist[ofs]] = lo_build(key, segment_offset + ofs);
-                }
+        size_t list_size = invlists->list_size(key);
+        InvertedLists::ScopedIds idlist(invlists, key);
+
+        if (new_type == Array) {
+            for (size_t ofs = 0; ofs < list_size; ofs++) {
+                FAISS_THROW_IF_NOT_MSG(
+                        0 <= idlist[ofs] &&
+                                static_cast<size_t>(idlist[ofs]) < ntotal,
+                        "direct map supported only for sequential ids");
+                array[idlist[ofs]] = lo_build(key, ofs);
+            }
+        } else if (new_type == Hashtable) {
+            for (size_t ofs = 0; ofs < list_size; ofs++) {
+                hashtable[idlist[ofs]] = lo_build(key, ofs);
             }
         }
     }
@@ -83,18 +72,15 @@ void DirectMap::clear() {
 
 idx_t DirectMap::get(idx_t key) const {
     if (type == Array) {
-        FAISS_THROW_IF_NOT_MSG(key >= 0 && key < array.size(), "invalid key");
+        FAISS_THROW_IF_NOT_MSG(
+                key >= 0 && static_cast<size_t>(key) < array.size(),
+                "invalid key");
         idx_t lo = array[key];
-        FAISS_THROW_IF_NOT_MSG(lo >= 0, "-1 entry in direct_map");
-        return lo;
-    } else if (type == ConcurrentArray) {
-        FAISS_THROW_IF_NOT_MSG(key >= 0 && key < concurrentArray.size(), "invalid key");
-        idx_t lo = concurrentArray[key];
         FAISS_THROW_IF_NOT_MSG(lo >= 0, "-1 entry in direct_map");
         return lo;
     } else if (type == Hashtable) {
         auto res = hashtable.find(key);
-        FAISS_THROW_IF_NOT_MSG(res != hashtable.end(), "key not found");
+        FAISS_THROW_IF_MSG(res == hashtable.end(), "key not found");
         return res->second;
     } else {
         FAISS_THROW_MSG("direct map not initialized");
@@ -102,8 +88,9 @@ idx_t DirectMap::get(idx_t key) const {
 }
 
 void DirectMap::add_single_id(idx_t id, idx_t list_no, size_t offset) {
-    if (type == NoMap)
+    if (type == NoMap) {
         return;
+    }
 
     if (type == Array) {
         assert(id == array.size());
@@ -111,13 +98,6 @@ void DirectMap::add_single_id(idx_t id, idx_t list_no, size_t offset) {
             array.push_back(lo_build(list_no, offset));
         } else {
             array.push_back(-1);
-        }
-    } else if (type == ConcurrentArray) {
-        assert(id == array.size());
-        if (list_no >= 0) {
-            concurrentArray.push_back(lo_build(list_no, offset));
-        } else {
-            concurrentArray.push_back(-1);
         }
     } else if (type == Hashtable) {
         if (list_no >= 0) {
@@ -127,23 +107,25 @@ void DirectMap::add_single_id(idx_t id, idx_t list_no, size_t offset) {
 }
 
 void DirectMap::check_can_add(const idx_t* ids) {
-    if ((type == Array || type == ConcurrentArray) && ids) {
+    if (type == Array && ids) {
         FAISS_THROW_MSG("cannot have array direct map and add with ids");
     }
 }
 
 /********************* DirectMapAdd implementation */
 
-DirectMapAdd::DirectMapAdd(DirectMap& direct_map, size_t n, const idx_t* xids)
-        : direct_map(direct_map), type(direct_map.type), n(n), xids(xids) {
+DirectMapAdd::DirectMapAdd(
+        DirectMap& direct_map_in,
+        size_t n_in,
+        const idx_t* xids_in)
+        : direct_map(direct_map_in),
+          type(direct_map_in.type),
+          n(n_in),
+          xids(xids_in) {
     if (type == DirectMap::Array) {
         FAISS_THROW_IF_NOT(xids == nullptr);
         ntotal = direct_map.array.size();
         direct_map.array.resize(ntotal + n, -1);
-    } else if (type == DirectMap::ConcurrentArray) {
-        FAISS_THROW_IF_NOT(xids == nullptr);
-        ntotal = direct_map.concurrentArray.size();
-        direct_map.concurrentArray.resize(ntotal + n , -1);
     } else if (type == DirectMap::Hashtable) {
         // can't parallel update hashtable so use temp array
         all_ofs.resize(n, -1);
@@ -153,8 +135,6 @@ DirectMapAdd::DirectMapAdd(DirectMap& direct_map, size_t n, const idx_t* xids)
 void DirectMapAdd::add(size_t i, idx_t list_no, size_t ofs) {
     if (type == DirectMap::Array) {
         direct_map.array[ntotal + i] = lo_build(list_no, ofs);
-    } else if (type == DirectMap::ConcurrentArray) {
-        direct_map.concurrentArray[ntotal + i] = lo_build(list_no, ofs);
     } else if (type == DirectMap::Hashtable) {
         all_ofs[i] = lo_build(list_no, ofs);
     }
@@ -162,7 +142,7 @@ void DirectMapAdd::add(size_t i, idx_t list_no, size_t ofs) {
 
 DirectMapAdd::~DirectMapAdd() {
     if (type == DirectMap::Hashtable) {
-        for (int i = 0; i < n; i++) {
+        for (size_t i = 0; i < n; i++) {
             idx_t id = xids ? xids[i] : ntotal + i;
             direct_map.hashtable[id] = all_ofs[i];
         }
@@ -187,7 +167,7 @@ size_t DirectMap::remove_ids(const IDSelector& sel, InvertedLists* invlists) {
         }
         // exhaustive scan of IVF
 #pragma omp parallel for
-        for (idx_t i = 0; i < nlist; i++) {
+        for (idx_t i = 0; i < static_cast<idx_t>(nlist); i++) {
             idx_t l0 = invlists->list_size(i), l = l0, j = 0;
             ScopedIds idsi(invlists, i);
             while (j < l) {
@@ -206,7 +186,7 @@ size_t DirectMap::remove_ids(const IDSelector& sel, InvertedLists* invlists) {
         }
         // this will not run well in parallel on ondisk because of
         // possible shrinks
-        for (idx_t i = 0; i < nlist; i++) {
+        for (idx_t i = 0; i < static_cast<idx_t>(nlist); i++) {
             if (toremove[i] > 0) {
                 nremove += toremove[i];
                 invlists->resize(i, invlists->list_size(i) - toremove[i]);
@@ -221,13 +201,13 @@ size_t DirectMap::remove_ids(const IDSelector& sel, InvertedLists* invlists) {
         FAISS_THROW_IF_NOT_MSG(
                 sela, "remove with hashtable works only with IDSelectorArray");
 
-        for (idx_t i = 0; i < sela->n; i++) {
+        for (idx_t i = 0; i < static_cast<idx_t>(sela->n); i++) {
             idx_t id = sela->ids[i];
             auto res = hashtable.find(id);
             if (res != hashtable.end()) {
                 size_t list_no = lo_listno(res->second);
                 size_t offset = lo_offset(res->second);
-                idx_t last = invlists->list_size(list_no) - 1;
+                size_t last = invlists->list_size(list_no) - 1;
                 hashtable.erase(res);
                 if (offset < last) {
                     idx_t last_id = invlists->get_single_id(list_no, last);
@@ -260,20 +240,24 @@ void DirectMap::update_codes(
 
     size_t code_size = invlists->code_size;
 
-    for (size_t i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++) {
         idx_t id = ids[i];
         FAISS_THROW_IF_NOT_MSG(
-                0 <= id && id < array.size(), "id to update out of range");
+                0 <= id && static_cast<size_t>(id) < array.size(),
+                "id to update out of range");
         { // remove old one
             idx_t dm = array[id];
             int64_t ofs = lo_offset(dm);
             int64_t il = lo_listno(dm);
             size_t l = invlists->list_size(il);
-            if (ofs != l - 1) { // move l - 1 to ofs
+            if (static_cast<size_t>(ofs) != l - 1) { // move l - 1 to ofs
                 int64_t id2 = invlists->get_single_id(il, l - 1);
                 array[id2] = lo_build(il, ofs);
                 invlists->update_entry(
-                        il, ofs, id2, invlists->get_single_code(il, l - 1));
+                        il,
+                        ofs,
+                        id2,
+                        InvertedLists::ScopedCodes(invlists, il, l - 1).get());
             }
             invlists->resize(il, l - 1);
         }

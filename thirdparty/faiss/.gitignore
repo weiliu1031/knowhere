@@ -6,10 +6,9 @@
 *.so
 *.dylib
 *.pyc
-*.cmake
-*.cbp
-*.tcl
 *~
+/build/
+/build_metal/
 /config.*
 /aclocal.m4
 /autom4te.cache/
@@ -19,20 +18,17 @@
 /c_api/gpu/bin/
 /tests/test
 /tests/gtest/
-/tests/faiss_test
+faiss/python/swigfaiss_avx2.swig
+faiss/python/swigfaiss_avx512.swig
+faiss/python/swigfaiss_avx512_spr.swig
+faiss/python/swigfaiss_sve.swig
 
-faiss/gpu/test/TestCodePacking
-faiss/gpu/test/TestGpuDistance
-faiss/gpu/test/TestGpuIndexBinaryFlat
-faiss/gpu/test/TestGpuIndexFlat
-faiss/gpu/test/TestGpuIndexIVFFlat
-faiss/gpu/test/TestGpuIndexIVFPQ
-faiss/gpu/test/TestGpuIndexIVFScalarQuantizer
-faiss/gpu/test/TestGpuMemoryException
-faiss/gpu/test/TestGpuSelect
+# Local intermediate build artifacts (CUDA 13.2 scripts)
+/_build/
+/_build_python_*/
+/_libfaiss_stage/
+/build_output/
 
-**/CMakeFiles/*
-CMakeCache.txt
-Makefile
-install_manifest.txt
-_deps/*
+# Python package build outputs
+/dist/
+/*.egg-info/

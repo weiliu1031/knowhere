@@ -27,13 +27,13 @@ class Benchmark_binary : public Benchmark_knowhere, public ::testing::Test {
         printf("\n[%0.3f s] %s | %s \n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str());
         printf("================================================================================\n");
         for (auto nq : NQs_) {
-            knowhere::DataSetPtr ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
+            auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
             for (auto k : TOPKs_) {
                 conf[knowhere::meta::TOPK] = k;
-                CALC_TIME_SPAN(auto result = index_.value().Search(*ds_ptr, conf, nullptr));
+                CALC_TIME_SPAN(auto result = index_.value().Search(ds_ptr, conf, nullptr));
                 auto ids = result.value()->GetIds();
                 float recall = CalcRecall(ids, nq, k);
-                printf("  nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", nq, k, t_diff, recall);
+                printf("  nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", nq, k, TDIFF_, recall);
                 std::fflush(stdout);
             }
         }
@@ -52,13 +52,13 @@ class Benchmark_binary : public Benchmark_knowhere, public ::testing::Test {
         for (auto nprobe : NPROBEs_) {
             conf[knowhere::indexparam::NPROBE] = nprobe;
             for (auto nq : NQs_) {
-                knowhere::DataSetPtr ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
+                auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
                 for (auto k : TOPKs_) {
                     conf[knowhere::meta::TOPK] = k;
-                    CALC_TIME_SPAN(auto result = index_.value().Search(*ds_ptr, conf, nullptr));
+                    CALC_TIME_SPAN(auto result = index_.value().Search(ds_ptr, conf, nullptr));
                     auto ids = result.value()->GetIds();
                     float recall = CalcRecall(ids, nq, k);
-                    printf("  nprobe = %4d, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", nprobe, nq, k, t_diff,
+                    printf("  nprobe = %4d, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", nprobe, nq, k, TDIFF_,
                            recall);
                     std::fflush(stdout);
                 }
@@ -83,10 +83,10 @@ class Benchmark_binary : public Benchmark_knowhere, public ::testing::Test {
                 auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
                 for (auto k : TOPKs_) {
                     conf[knowhere::meta::TOPK] = k;
-                    CALC_TIME_SPAN(auto result = index_.value().Search(*ds_ptr, conf, nullptr));
+                    CALC_TIME_SPAN(auto result = index_.value().Search(ds_ptr, conf, nullptr));
                     auto ids = result.value()->GetIds();
                     float recall = CalcRecall(ids, nq, k);
-                    printf("  ef = %4d, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", ef, nq, k, t_diff, recall);
+                    printf("  ef = %4d, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", ef, nq, k, TDIFF_, recall);
                     std::fflush(stdout);
                 }
             }
@@ -99,13 +99,14 @@ class Benchmark_binary : public Benchmark_knowhere, public ::testing::Test {
     void
     SetUp() override {
         T0_ = elapsed();
-        // set_ann_test_name("sift-128-euclidean");
         set_ann_test_name("sift-4096-hamming");
         parse_ann_test_name();
-        load_hdf5_data<true>();
+        load_hdf5_data<knowhere::bin1>();
 
         cfg_[knowhere::meta::METRIC_TYPE] = metric_type_;
         knowhere::KnowhereConfig::SetSimdType(knowhere::KnowhereConfig::SimdType::AVX2);
+        knowhere::KnowhereConfig::SetBuildThreadPoolSize(default_build_thread_num);
+        knowhere::KnowhereConfig::SetSearchThreadPoolSize(default_search_thread_num);
         printf("faiss::distance_compute_blas_threshold: %ld\n", knowhere::KnowhereConfig::GetBlasThreshold());
     }
 
@@ -175,8 +176,9 @@ TEST_F(Benchmark_binary, TEST_BINARY_IDMAP) {
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_BIN_IDMAP;
 
     knowhere::Json conf = cfg_;
-    std::string index_file_name = get_index_name({});
-    create_index(index_file_name, conf);
+    std::vector<int32_t> params = {};
+    std::string index_file_name = get_index_name<knowhere::bin1>(params);
+    create_index<knowhere::bin1>(index_file_name, conf);
     test_binary_idmap(conf);
 }
 
@@ -186,8 +188,9 @@ TEST_F(Benchmark_binary, TEST_BINARY_IVF_FLAT) {
     knowhere::Json conf = cfg_;
     for (auto nlist : NLISTs_) {
         conf[knowhere::indexparam::NLIST] = nlist;
-        std::string index_file_name = get_index_name({nlist});
-        create_index(index_file_name, conf);
+        std::vector<int32_t> params = {nlist};
+        std::string index_file_name = get_index_name<knowhere::bin1>(params);
+        create_index<knowhere::bin1>(index_file_name, conf);
         test_binary_ivf(conf);
     }
 }
@@ -200,8 +203,9 @@ TEST_F(Benchmark_binary, TEST_BINARY_HNSW) {
         conf[knowhere::indexparam::HNSW_M] = M;
         for (auto efc : EFCONs_) {
             conf[knowhere::indexparam::EFCONSTRUCTION] = efc;
-            std::string index_file_name = get_index_name({M, efc});
-            create_index(index_file_name, conf);
+            std::vector<int32_t> params = {M, efc};
+            std::string index_file_name = get_index_name<knowhere::bin1>(params);
+            create_index<knowhere::bin1>(index_file_name, conf);
             test_binary_hnsw(conf);
         }
     }

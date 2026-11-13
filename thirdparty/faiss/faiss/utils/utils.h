@@ -1,5 +1,5 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -8,7 +8,7 @@
 // -*- c++ -*-
 
 /*
- *  A few utilitary functions for similarity search:
+ *  A few utility functions for similarity search:
  * - optimized exhaustive distance and knn search functions
  * - some functions reimplemented from torch for speed
  */
@@ -37,6 +37,9 @@ std::string get_compile_options();
  * Get some stats about the system
  **************************************************/
 
+// Expose Faiss version as a string
+std::string get_version();
+
 /// ms elapsed since some arbitrary epoch
 double getmillisecs();
 
@@ -48,27 +51,6 @@ uint64_t get_cycles();
 /***************************************************************************
  * Misc  matrix and vector manipulation functions
  ***************************************************************************/
-
-/** compute c := a + bf * b for a, b and c tables
- *
- * @param n   size of the tables
- * @param a   size n
- * @param b   size n
- * @param c   restult table, size n
- */
-// // Provided by Knowhere.
-// void fvec_madd(size_t n, const float* a, float bf, const float* b, float* c);
-
-/** same as fvec_madd, also return index of the min of the result table
- * @return    index of the min of table c
- */
-// // Provided by Knowhere.
-// int fvec_madd_and_argmin(
-//         size_t n,
-//         const float* a,
-//         float bf,
-//         const float* b,
-//         float* c);
 
 /* perform a reflection (not an efficient implementation, just for test ) */
 void reflection(const float* u, float* x, size_t n, size_t d, size_t nu);
@@ -82,7 +64,7 @@ void matrix_qr(int m, int n, float* a);
 void ranklist_handle_ties(int k, int64_t* idx, const float* dis);
 
 /** count the number of common elements between v1 and v2
- * algorithm = sorting + bissection to avoid double-counting duplicates
+ * algorithm = sorting + bisection to avoid double-counting duplicates
  */
 size_t ranklist_intersection_size(
         size_t k1,
@@ -108,11 +90,12 @@ size_t merge_result_table_with(
         bool keep_min = true,
         int64_t translation = 0);
 
-/// a balanced assignment has a IF of 1
-double imbalance_factor(int n, int k, const int64_t* assign);
+/// a balanced assignment has a IF of 1, a completely unbalanced assignment has
+/// an IF = k.
+double imbalance_factor(int64_t n, int k, const int64_t* assign);
 
 /// same, takes a histogram as input
-double imbalance_factor(int k, const int* hist);
+double imbalance_factor(int k, const int64_t* hist);
 
 /// compute histogram on v
 int ivec_hist(size_t n, const int* v, int vmax, int* hist);
@@ -179,9 +162,6 @@ uint64_t hash_bytes(const uint8_t* bytes, int64_t n);
 /** Whether OpenMP annotations were respected. */
 bool check_openmp();
 
-/** Get L3 cache size */
-int64_t get_l3_size();
-
 /** This class is used to combine range and knn search results
  * in contrib.exhaustive_search.range_search_gpu */
 
@@ -192,8 +172,8 @@ struct CombinerRangeKNN {
     T r2;          /// range search radius
     bool keep_max; /// whether to keep max values instead of min.
 
-    CombinerRangeKNN(int64_t nq, size_t k, T r2, bool keep_max)
-            : nq(nq), k(k), r2(r2), keep_max(keep_max) {}
+    CombinerRangeKNN(int64_t nq_in, size_t k_in, T r2_in, bool keep_max_in)
+            : nq(nq_in), k(k_in), r2(r2_in), keep_max(keep_max_in) {}
 
     /// Knn search results
     const int64_t* I = nullptr; /// size nq * k
@@ -220,7 +200,7 @@ struct CodeSet {
     size_t d;
     std::set<std::vector<uint8_t>> s;
 
-    explicit CodeSet(size_t d) : d(d) {}
+    explicit CodeSet(size_t d_in) : d(d_in) {}
     void insert(size_t n, const uint8_t* codes, bool* inserted);
 };
 

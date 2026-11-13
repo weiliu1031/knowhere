@@ -11,8 +11,8 @@
 
 #include "knowhere/index/index_node_thread_pool_wrapper.h"
 
-#include "knowhere/comp/thread_pool.h"
 #include "knowhere/index/index_node.h"
+#include "knowhere/thread_pool.h"
 
 namespace knowhere {
 
@@ -36,13 +36,18 @@ IndexNodeThreadPoolWrapper::IndexNodeThreadPoolWrapper(std::unique_ptr<IndexNode
 }
 
 expected<DataSetPtr>
-IndexNodeThreadPoolWrapper::Search(const DataSet& dataset, const Config& cfg, const BitsetView& bitset) const {
-    return thread_pool_->push([&]() { return this->index_node_->Search(dataset, cfg, bitset); }).get();
+IndexNodeThreadPoolWrapper::Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+                                   milvus::OpContext* op_context) const {
+    return thread_pool_->push([&]() { return this->index_node_->Search(dataset, std::move(cfg), bitset, op_context); })
+        .get();
 }
 
 expected<DataSetPtr>
-IndexNodeThreadPoolWrapper::RangeSearch(const DataSet& dataset, const Config& cfg, const BitsetView& bitset) const {
-    return thread_pool_->push([&]() { return this->index_node_->RangeSearch(dataset, cfg, bitset); }).get();
+IndexNodeThreadPoolWrapper::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+                                        milvus::OpContext* op_context) const {
+    return thread_pool_
+        ->push([&]() { return this->index_node_->RangeSearch(dataset, std::move(cfg), bitset, op_context); })
+        .get();
 }
 
 }  // namespace knowhere

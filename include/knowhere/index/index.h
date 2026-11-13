@@ -12,13 +12,60 @@
 #ifndef INDEX_H
 #define INDEX_H
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
 #include "knowhere/binaryset.h"
 #include "knowhere/config.h"
 #include "knowhere/dataset.h"
 #include "knowhere/expected.h"
 #include "knowhere/index/index_node.h"
-
+#include "knowhere/index/interrupt.h"
 namespace knowhere {
+
+// Borrowed, LSB-first output window. Validity operations only clear bits.
+struct MutableBitmapView {
+    uint8_t* data = nullptr;
+    size_t capacity_bytes = 0;
+    size_t bit_offset = 0;
+};
+
+struct MappingMmapOptions {
+    bool search_ids = false;
+    bool retrieval_ids = false;
+    std::string directory;
+};
+
+struct BuildOptions {
+    // Use append-capable nullable mapping for a growing index.
+    bool growing = false;
+    MappingMmapOptions mmap;
+};
+
+// Borrowed for the duration of Deserialize or ImportValidity.
+// Offsets address logical rows, or logical lists for an embedding-list index.
+struct ValidityView {
+    const uint8_t* data = nullptr;
+    size_t size_bytes = 0;
+    uint64_t logical_row_count = 0;
+};
+
+struct LoadOptions {
+    std::optional<ValidityView> validity;
+    MappingMmapOptions mmap;
+    // The source field is an embedding list. Ordinary metrics index its
+    // flattened vectors, while persisted validity may still describe lists.
+    bool embedding_list = false;
+};
+
+struct ValidityData {
+    uint64_t logical_row_count = 0;
+    std::vector<uint8_t> packed_bits;
+};
+
 template <typename T1>
 class Index {
  public:
@@ -138,63 +185,144 @@ class Index {
         return Index(dynamic_cast<T2>(node));
     }
 
-    Status
-    Build(const DataSet& dataset, const Json& json);
+    // Mapping metadata only; never calls the backend Count(). Without nullable
+    // input these counts are zero. Count() keeps its backend-specific meaning.
+    expected<bool>
+    HasValidity() const noexcept;
+
+    expected<size_t>
+    ValidCount() const noexcept;
+
+    // Represented public-row extent, which may omit trailing NULL rows after
+    // sealed reload. Growing maps retain the exact number of consumed rows.
+    expected<size_t>
+    LogicalCount() const noexcept;
+
+    // Validity is not MVCC. Callers retain their frozen query row boundary.
+    expected<bool>
+    IsRowValid(int64_t logical_offset) const noexcept;
 
     Status
-    Train(const DataSet& dataset, const Json& json);
+    IntersectValidity(int64_t logical_offset, size_t count, MutableBitmapView target) const noexcept;
 
     Status
-    Add(const DataSet& dataset, const Json& json);
+    IntersectValidityAt(const int64_t* logical_offsets, size_t count, MutableBitmapView target) const noexcept;
+
+    // Exports the represented extent, not an independently known segment count.
+    // Writers requiring the complete row domain must retain its original count
+    // and zero-pad any omitted NULL tail. Build/Add retain complete batch counts.
+    expected<std::optional<ValidityData>>
+    ExportValidity() const noexcept;
+
+    // Restore the nullable sidecar without loading a backend payload (e.g. an
+    // all-null index). Does not change backend ownership or lifecycle.
+    Status
+    ImportValidity(const ValidityView& input, const MappingMmapOptions& mmap = {}) noexcept;
+
+    BuildInputOptions
+    GetBuildInputOptions() const {
+        return node->GetBuildInputOptions();
+    }
+
+    // Nonblocking reservation for Build with the same dataset shape and configuration.
+    // See IndexNode::TryReserveBuild for return values and reservation lifetime.
+    expected<bool>
+    TryReserveBuild(const DataSetPtr dataset, const Json& json) noexcept;
+
+    Status
+    Build(const DataSetPtr dataset, const Json& json, bool use_knowhere_build_pool = true,
+          const BuildOptions& options = {}, milvus::OpContext* op_context = nullptr) noexcept;
+
+#ifdef KNOWHERE_WITH_CARDINAL
+    const std::shared_ptr<Interrupt>
+    BuildAsync(const DataSetPtr dataset, const Json& json,
+               const std::chrono::seconds timeout = std::chrono::seconds::max(), const BuildOptions& options = {},
+               std::shared_ptr<milvus::OpContext> op_context = nullptr) noexcept;
+#else
+    const std::shared_ptr<Interrupt>
+    BuildAsync(const DataSetPtr dataset, const Json& json, bool use_knowhere_build_pool = true,
+               const BuildOptions& options = {}, std::shared_ptr<milvus::OpContext> op_context = nullptr) noexcept;
+#endif
+
+    Status
+    Train(const DataSetPtr dataset, const Json& json, bool use_knowhere_build_pool = true) noexcept;
+
+    Status
+    Add(const DataSetPtr dataset, const Json& json, bool use_knowhere_build_pool = true) noexcept;
 
     expected<DataSetPtr>
-    Search(const DataSet& dataset, const Json& json, const BitsetView& bitset) const;
+    Search(const DataSetPtr dataset, const Json& json, const BitsetView& bitset,
+           milvus::OpContext* op_context = nullptr) const noexcept;
 
-    expected<std::vector<std::shared_ptr<IndexNode::iterator>>>
-    AnnIterator(const DataSet& dataset, const Json& json, const BitsetView& bitset) const;
+    expected<std::vector<IndexNode::IteratorPtr>>
+    AnnIterator(const DataSetPtr dataset, const Json& json, const BitsetView& bitset,
+                bool use_knowhere_search_pool = true, milvus::OpContext* op_context = nullptr) const noexcept;
 
     expected<DataSetPtr>
-    RangeSearch(const DataSet& dataset, const Json& json, const BitsetView& bitset) const;
+    RangeSearch(const DataSetPtr dataset, const Json& json, const BitsetView& bitset,
+                milvus::OpContext* op_context = nullptr) const noexcept;
 
     expected<DataSetPtr>
-    GetVectorByIds(const DataSet& dataset) const;
+    GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context = nullptr) const noexcept;
+
+    expected<DataSetPtr>
+    GetEmbListByIds(const DataSetPtr dataset, const std::string& metric_type,
+                    milvus::OpContext* op_context = nullptr) const noexcept;
+
+    expected<DataSetPtr>
+    CalcDistByIDs(const DataSetPtr dataset, const BitsetView& bitset, const int64_t* labels, const size_t labels_len,
+                  const bool is_cosine, milvus::OpContext* op_context = nullptr) const noexcept;
 
     bool
-    HasRawData(const std::string& metric_type) const;
+    HasRawData(const std::string& metric_type) const noexcept;
 
     bool
-    IsAdditionalScalarSupported() const;
+    IsAdditionalScalarSupported(bool is_mv_only) const noexcept;
+
+    bool
+    IsIndexRefineEnabled() const noexcept;
 
     expected<DataSetPtr>
-    GetIndexMeta(const Json& json) const;
+    GetIndexMeta(const Json& json) const noexcept;
 
     Status
-    Serialize(BinarySet& binset) const;
+    Serialize(BinarySet& binset) const noexcept;
+
+    // Optional preflight for a subsequent Deserialize on this same node and input.
+    // Backends may retain parsed metadata until Deserialize or node destruction.
+    expected<LoadRequirements>
+    InspectLoadRequirements(const BinarySet& binset, const Json& json = {}) noexcept;
+
+    // Restore validity alongside the backend payload.
+    Status
+    Deserialize(const BinarySet& binset, const Json& json = {}, const LoadOptions& options = {}) noexcept;
 
     Status
-    Deserialize(const BinarySet& binset, const Json& json = {});
-
-    Status
-    DeserializeFromFile(const std::string& filename, const Json& json = {});
+    DeserializeFromFile(const std::string& filename, const Json& json = {}, const LoadOptions& options = {}) noexcept;
 
     int64_t
-    Dim() const;
+    Dim() const noexcept;
 
     int64_t
-    Size() const;
+    Size() const noexcept;
 
     int64_t
-    Count() const;
+    Count() const noexcept;
 
     std::string
-    Type() const;
+    Type() const noexcept;
+
+    [[nodiscard]] bool
+    LoadIndexWithStream() const noexcept;
 
     ~Index() {
         if (node == nullptr)
             return;
         node->DecRef();
-        if (!node->Ref())
+        if (!node->Ref()) {
             delete node;
+            node = nullptr;
+        }
     }
 
  private:

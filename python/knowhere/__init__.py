@@ -4,10 +4,11 @@ from .swigknowhere import CreateBinarySet, GetBinarySet, GetNullDataSet, GetNull
 from .swigknowhere import BruteForceSearchFloat, BruteForceRangeSearchFloat
 from .swigknowhere import BruteForceSearchFP16, BruteForceRangeSearchFP16
 from .swigknowhere import BruteForceSearchBF16, BruteForceRangeSearchBF16
+from .swigknowhere import BruteForceSearchInt8, BruteForceRangeSearchInt8
 from .swigknowhere import BruteForceSearchBin, BruteForceRangeSearchBin
 
 import numpy as np
-from bfloat16 import bfloat16
+from ml_dtypes import bfloat16
 
 
 def CreateIndex(name, version, type=np.float32):
@@ -19,6 +20,8 @@ def CreateIndex(name, version, type=np.float32):
         return swigknowhere.IndexWrapBF16(name, version)
     if type == np.uint8:
         return swigknowhere.IndexWrapBin(name, version)
+    if type == np.int8:
+        return swigknowhere.IndexWrapInt8(name, version)
 
 def BruteForceSearch(type=np.float32, *args):
     if type == np.float32:
@@ -27,6 +30,8 @@ def BruteForceSearch(type=np.float32, *args):
         return BruteForceSearchFP16(*args)
     if type == bfloat16:
         return BruteForceSearchBF16(*args)
+    if type == np.int8:
+        return BruteForceSearchInt8(*args)
     if type == np.uint8:
         return BruteForceSearchBin(*args)
 
@@ -37,6 +42,8 @@ def BruteForceRangeSearch(type=np.float32, *args):
         return BruteForceRangeSearchFP16(*args)
     if type == bfloat16:
         return BruteForceRangeSearchBF16(*args)
+    if type == np.int8:
+        return BruteForceRangeSearchInt8(*args)
     if type == np.uint8:
         return BruteForceRangeSearchBin(*args)
 
@@ -74,6 +81,8 @@ def ArrayToDataSet(arr):
         return swigknowhere.Array2DataSetIds(arr)
     if arr.ndim == 2:
         if arr.dtype == np.uint8:
+            return swigknowhere.Array2DataSetU(arr)
+        if arr.dtype == np.int8:
             return swigknowhere.Array2DataSetI(arr)
         if arr.dtype == np.float32:
             return swigknowhere.Array2DataSetF(arr)
@@ -85,7 +94,41 @@ def ArrayToDataSet(arr):
             return swigknowhere.Array2DataSetBF16(arr)
     raise ValueError(
         """
-        ArrayToDataSet only support numpy array dtype float32,uint8,float16 and bfloat16.
+        ArrayToDataSet only support numpy array dtype float32, uint8, int8, float16 and bfloat16.
+        """
+    )
+
+def ArrayToDataSetWithOffsets(arr, offsets):
+    if arr.ndim == 2:
+        if arr.dtype == np.uint8:
+            return swigknowhere.Array2DataSetU(arr, offsets)
+        if arr.dtype == np.int8:
+            return swigknowhere.Array2DataSetI(arr, offsets)
+        if arr.dtype == np.float32:
+            return swigknowhere.Array2DataSetF(arr, offsets)
+        if arr.dtype == np.float16:
+            arr = arr.astype(np.float32)
+            return swigknowhere.Array2DataSetFP16(arr, offsets)
+        if arr.dtype == bfloat16:
+            arr = arr.astype(np.float32)
+            return swigknowhere.Array2DataSetBF16(arr, offsets)
+    raise ValueError(
+        """
+        ArrayToDataSetWithOffsets only support numpy array dtype float32, uint8, int8, float16 and bfloat16.
+        """
+    )
+
+# follow csr_matrix format
+# row i are stored in ``indices[indptr[i]:indptr[i+1]]`` and their
+# corresponding values are stored in ``data[indptr[i]:indptr[i+1]]
+def ArrayToSparseDataSet(data, indices, indptr):
+    if data.ndim == 1 and indices.ndim == 1 and indptr.ndim == 1:
+        assert data.shape[0] == indices.shape[0]
+        assert indptr.shape[0] > 1
+        return swigknowhere.Array2SparseDataSet(data, indices, indptr)
+    raise ValueError(
+        """
+        ArrayToSparseDataSet input type wrong.
         """
     )
 
@@ -160,6 +203,13 @@ def GetBinaryVectorDataSetToArray(ans):
     rows = swigknowhere.DataSet_Rows(ans)
     data = np.zeros([rows, dim]).astype(np.uint8)
     swigknowhere.BinaryDataSetTensor2Array(ans, data)
+    return data
+
+def GetInt8VectorDataSetToArray(ans):
+    dim = swigknowhere.DataSet_Dim(ans)
+    rows = swigknowhere.DataSet_Rows(ans)
+    data = np.zeros([rows, dim]).astype(np.int8)
+    swigknowhere.Int8DataSetTensor2Array(ans, data)
     return data
 
 def SetSimdType(type):

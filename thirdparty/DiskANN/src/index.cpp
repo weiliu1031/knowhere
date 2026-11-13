@@ -5,45 +5,36 @@
 // CHECK FOR BULK AND FRESH
 // CHECK FOR FLOAT, INT8 and UINT8
 
-#include <type_traits>
-#include <omp.h>
-#include <random>
-// #include <semaphore.h>
+#include <fcntl.h>
+#include <unordered_map>
 #include <set>
 #include <shared_mutex>
-#include <sstream>
 #include <string>
-#include "knowhere/log.h"
-#include "knowhere/comp/thread_pool.h"
+#include <type_traits>
+
+#include "boost/dynamic_bitset.hpp"
 #include "tsl/robin_set.h"
-#include "tsl/robin_map.h"
-#include <unordered_map>
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <time.h>
-
+#include "diskann/ann_exception.h"
 #include "diskann/common_includes.h"
+#include "diskann/defaults.h"
+#include "diskann/index.h"
 #include "diskann/logger.h"
-#include "diskann/exceptions.h"
-#include "diskann/aligned_file_reader.h"
-#include "diskann/math_utils.h"
-#include "diskann/memory_mapper.h"
 #include "diskann/parameters.h"
 #include "diskann/partition_and_pq.h"
 #include "diskann/timer.h"
 #include "diskann/utils.h"
-#include "diskann/ann_exception.h"
+#include "knowhere/comp/task.h"
+#include "knowhere/log.h"
+
 #if defined(RELEASE_UNUSED_TCMALLOC_MEMORY_AT_CHECKPOINTS) && \
     defined(DISKANN_BUILD)
 #include "gperftools/malloc_extension.h"
 #endif
-#include "boost/dynamic_bitset.hpp"
 
 #if !defined(__ARM_NEON) || !defined(__aarch64__)
 #include <xmmintrin.h>
 #endif
-#include "diskann/index.h"
 
 #define MAX_POINTS_FOR_USING_BITSET 10000000
 
@@ -404,7 +395,8 @@ namespace diskann {
     _u64 index_size = 24;
     _u32 max_degree = 0;
     out.write((char *) &index_size, sizeof(uint64_t));
-    out.write((char *) &_width, sizeof(unsigned));
+    unsigned width = _width.load(std::memory_order_relaxed);
+    out.write((char *) &width, sizeof(unsigned));
     unsigned ep_u32 = _ep;
     out.write((char *) &ep_u32, sizeof(unsigned));
     out.write((char *) &_num_frozen_pts, sizeof(_u64));
@@ -662,7 +654,9 @@ namespace diskann {
     std::ifstream in(filename, std::ios::binary);
     in.seekg(file_offset, in.beg);
     in.read((char *) &expected_file_size, sizeof(_u64));
-    in.read((char *) &_width, sizeof(unsigned));
+    unsigned width = 0;
+    in.read((char *) &width, sizeof(unsigned));
+    _width.store(width, std::memory_order_relaxed);
     in.read((char *) &_ep, sizeof(unsigned));
     in.read((char *) &file_frozen_pts, sizeof(_u64));
     _u64 vamana_metadata_size =
@@ -1150,7 +1144,13 @@ namespace diskann {
                                   -1);
     }
 
-    _width = (std::max)(_width, range);
+    // Pruning runs concurrently for different nodes. Only the maximum value
+    // is shared here; it does not publish any graph data.
+    auto width = _width.load(std::memory_order_relaxed);
+    while (width < range &&
+           !_width.compare_exchange_weak(width, range,
+                                          std::memory_order_relaxed)) {
+    }
 
     // sort the pool based on distance to query
     std::sort(pool.begin(), pool.end());
@@ -1207,7 +1207,7 @@ namespace diskann {
             _final_graph[des].end()) {
           _final_graph[des].push_back(n);
           if (_final_graph[des].size() >
-              (unsigned) (range * GRAPH_SLACK_FACTOR))
+              (unsigned) (range * diskann::defaults::GRAPH_SLACK_FACTOR))
             need_to_sync[des] = 1;
         }
       }  // des lock is released by this point
@@ -1245,7 +1245,7 @@ namespace diskann {
       {
         LockGuard guard(_locks[des]);
         if (std::find(des_pool.begin(), des_pool.end(), n) == des_pool.end()) {
-          if (des_pool.size() < (_u64) (GRAPH_SLACK_FACTOR * range)) {
+          if (des_pool.size() < (_u64) (diskann::defaults::GRAPH_SLACK_FACTOR * range)) {
             des_pool.emplace_back(n);
             if (update_in_graph) {
               LockGuard guard(_locks_in[n]);
@@ -1265,7 +1265,7 @@ namespace diskann {
         std::vector<Neighbor>    dummy_pool(0);
 
         size_t reserveSize =
-            (size_t) (std::ceil(1.05 * GRAPH_SLACK_FACTOR * range));
+            (size_t) (std::ceil(1.05 * diskann::defaults::GRAPH_SLACK_FACTOR * range));
         dummy_visited.reserve(reserveSize);
         dummy_pool.reserve(reserveSize);
 
@@ -1343,7 +1343,11 @@ namespace diskann {
     unsigned    L = _indexingQueueSize;
 
     std::vector<unsigned> Lvec;
-    Lvec.push_back(unsigned(0.8 * L));
+    unsigned first_L = unsigned(0.8*L);
+    if(!first_L){
+    	first_L=1;
+    }
+    Lvec.push_back(first_L);
     Lvec.push_back(L);
     const unsigned NUM_RNDS = 2;
 
@@ -1381,7 +1385,7 @@ namespace diskann {
 
     for (uint64_t p = 0; p < _nd; p++) {
       _final_graph[p].reserve(
-          (size_t) (std::ceil(_indexingRange * GRAPH_SLACK_FACTOR * 1.05)));
+          (size_t) (std::ceil(_indexingRange * diskann::defaults::GRAPH_SLACK_FACTOR * 1.05)));
     }
 
     std::random_device               rd;
@@ -1414,7 +1418,7 @@ namespace diskann {
 
       double   sync_time = 0, total_sync_time = 0;
       double   inter_time = 0, total_inter_time = 0;
-      size_t   inter_count = 0, total_inter_count = 0;
+      size_t   total_inter_count = 0;
       unsigned progress_counter = 0;
 
       size_t round_size = DIV_ROUND_UP(_nd, num_syncs);  // size of each batch
@@ -1532,7 +1536,6 @@ namespace diskann {
           if (need_to_sync[cur_node] != 0) {
             futures.emplace_back(_build_thread_pool->push([&, node_id = cur_node]() {
               need_to_sync[node_id] = 0;
-              inter_count++;
               tsl::robin_set<unsigned> dummy_visited(0);
               std::vector<Neighbor>    dummy_pool(0);
               std::vector<unsigned>    new_out_neighbors;
@@ -1557,6 +1560,9 @@ namespace diskann {
           }
         }
         knowhere::WaitAllSuccess(futures);
+        // Each completed task prunes one node. Count on the calling thread
+        // and include every batch, even after the final progress log.
+        total_inter_count += futures.size();
         futures.clear();
 
         diff = std::chrono::high_resolution_clock::now() - s;
@@ -1572,10 +1578,8 @@ namespace diskann {
           LOG_KNOWHERE_INFO_ << stream.str();
           total_sync_time += sync_time;
           total_inter_time += inter_time;
-          total_inter_count += inter_count;
           sync_time = 0;
           inter_time = 0;
-          inter_count = 0;
           progress_counter += 20;
         }
       }
@@ -1786,7 +1790,7 @@ namespace diskann {
                          << (float) total / (float) (_nd + _num_frozen_pts)
                          << "  min:" << min << "  count(deg<2):" << cnt;
     }
-    _width = (std::max)((unsigned) max, _width);
+    _width = (std::max)((unsigned) max, _width.load(std::memory_order_relaxed));
     _has_built = true;
   }
 
@@ -1897,7 +1901,7 @@ namespace diskann {
                          << (float) total / (float) (_nd + _num_frozen_pts)
                          << "  min:" << min << "  count(deg<2):" << cnt;
     }
-    _width = (std::max)((unsigned) max, _width);
+    _width = (std::max)((unsigned) max, _width.load(std::memory_order_relaxed));
     _has_built = true;
   }
 
@@ -2799,7 +2803,7 @@ namespace diskann {
 
     _final_graph[location].clear();
     _final_graph[location].shrink_to_fit();
-    _final_graph[location].reserve((_u64) (range * GRAPH_SLACK_FACTOR * 1.05));
+    _final_graph[location].reserve((_u64) (range * diskann::defaults::GRAPH_SLACK_FACTOR * 1.05));
 
     assert(!pruned_list.empty());
     {
@@ -3000,6 +3004,7 @@ namespace diskann {
     for (unsigned i = 0; i < _nd; i++) {
       char *cur_node_offset = _opt_graph + i * _node_size;
       float cur_norm = norm_l2sqr(_data + i * _aligned_dim, _aligned_dim);
+      cur_norm = (cur_norm == 0.0 ? 1.0 : cur_norm);
       std::memcpy(cur_node_offset, &cur_norm, sizeof(float));
       std::memcpy(cur_node_offset + sizeof(float), _data + i * _aligned_dim,
                   _data_len - sizeof(float));

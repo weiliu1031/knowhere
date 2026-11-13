@@ -26,34 +26,81 @@ class IndexNodeDataMockWrapper : public IndexNode {
         }
     }
 
-    Status
-    Build(const DataSet& dataset, const Config& cfg) override;
+    BuildInputOptions
+    GetBuildInputOptions() const override {
+        return index_node_->GetBuildInputOptions();
+    }
+
+    expected<bool>
+    TryReserveBuild(const DataSetPtr dataset, std::shared_ptr<Config> cfg) override {
+        // Shape is unchanged by conversion; the wrapped node budgets for its own data type.
+        return index_node_->TryReserveBuild(dataset, std::move(cfg));
+    }
+
+    void
+    ReleaseBuildReservation() noexcept override {
+        index_node_->ReleaseBuildReservation();
+    }
 
     Status
-    Train(const DataSet& dataset, const Config& cfg) override;
+    Build(const DataSetPtr dataset, std::shared_ptr<Config> cfg, bool use_knowhere_build_pool,
+          milvus::OpContext* op_context) override;
 
     Status
-    Add(const DataSet& dataset, const Config& cfg) override;
-    expected<DataSetPtr>
-    Search(const DataSet& dataset, const Config& cfg, const BitsetView& bitset) const override;
+    Train(const DataSetPtr dataset, std::shared_ptr<Config> cfg, bool use_knowhere_build_pool) override;
+
+    Status
+    Add(const DataSetPtr dataset, std::shared_ptr<Config> cfg, bool use_knowhere_build_pool) override;
+
+    Status
+    AddEmbList(const DataSetPtr dataset, std::shared_ptr<Config> cfg, const size_t* lims, size_t num_rows,
+               bool use_knowhere_build_pool) override;
 
     expected<DataSetPtr>
-    RangeSearch(const DataSet& dataset, const Config& cfg, const BitsetView& bitset) const override;
-
-    expected<std::vector<std::shared_ptr<iterator>>>
-    AnnIterator(const DataSet& dataset, const Config& cfg, const BitsetView& bitset) const override;
+    Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+           milvus::OpContext* op_context) const override;
 
     expected<DataSetPtr>
-    GetVectorByIds(const DataSet& dataset) const override;
+    RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+                milvus::OpContext* op_context) const override;
+
+    expected<std::vector<IteratorPtr>>
+    AnnIterator(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+                bool use_knowhere_search_pool, milvus::OpContext* op_context) const override;
+
+    expected<DataSetPtr>
+    GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const override;
+
+    expected<DataSetPtr>
+    CalcDistByStorageIds(const DataSetPtr dataset, const BitsetView& bitset, const int64_t* labels,
+                         const size_t labels_len, const bool is_cosine, milvus::OpContext* op_context) const override;
+    std::optional<size_t>
+    GetQueryCodeSize(const DataSetPtr dataset) const override {
+        auto dim = dataset->GetDim();
+        if constexpr (std::is_same_v<DataType, knowhere::fp32>) {
+            return 4 * dim;
+        } else if constexpr (std::is_same_v<DataType, knowhere::fp16>) {
+            return 2 * dim;
+        } else if constexpr (std::is_same_v<DataType, knowhere::bf16>) {
+            return 2 * dim;
+        }
+        LOG_KNOWHERE_ERROR_ << "Unsupported data type";
+        return std::nullopt;
+    }
 
     bool
     HasRawData(const std::string& metric_type) const override {
         return index_node_->HasRawData(metric_type);
     }
 
+    bool
+    IsIndexRefineEnabled() const override {
+        return index_node_->IsIndexRefineEnabled();
+    }
+
     expected<DataSetPtr>
-    GetIndexMeta(const Config& cfg) const override {
-        return index_node_->GetIndexMeta(cfg);
+    GetIndexMeta(std::unique_ptr<Config> cfg) const override {
+        return index_node_->GetIndexMeta(std::move(cfg));
     }
 
     Status
@@ -61,14 +108,19 @@ class IndexNodeDataMockWrapper : public IndexNode {
         return index_node_->Serialize(binset);
     }
 
-    Status
-    Deserialize(const BinarySet& binset, const Config& config) override {
-        return index_node_->Deserialize(binset, config);
+    expected<LoadRequirements>
+    InspectLoadRequirements(const BinarySet& binset, std::shared_ptr<Config> cfg) override {
+        return index_node_->InspectLoadRequirements(binset, std::move(cfg));
     }
 
     Status
-    DeserializeFromFile(const std::string& filename, const Config& config) override {
-        return index_node_->DeserializeFromFile(filename, config);
+    Deserialize(const BinarySet& binset, std::shared_ptr<Config> cfg) override {
+        return index_node_->Deserialize(binset, std::move(cfg));
+    }
+
+    Status
+    DeserializeFromFile(const std::string& filename, std::shared_ptr<Config> cfg) override {
+        return index_node_->DeserializeFromFile(filename, std::move(cfg));
     }
 
     std::unique_ptr<BaseConfig>
@@ -89,6 +141,46 @@ class IndexNodeDataMockWrapper : public IndexNode {
     int64_t
     Count() const override {
         return index_node_->Count();
+    }
+
+    bool
+    NeedBitsetExactCount() const override {
+        return index_node_->NeedBitsetExactCount();
+    }
+
+    IdMap&
+    GetIdMap() override {
+        return index_node_->GetIdMap();
+    }
+
+    const IdMap&
+    GetIdMap() const override {
+        return index_node_->GetIdMap();
+    }
+
+    void
+    SetIdMapType(IdMap::Type type) override {
+        index_node_->SetIdMapType(type);
+    }
+
+    int64_t
+    MapOutToIn(int64_t out_id) const override {
+        return index_node_->MapOutToIn(out_id);
+    }
+
+    Status
+    CompactOutToIn(const int64_t* out_ids, size_t count, std::vector<int64_t>& compact_ids) const override {
+        return index_node_->CompactOutToIn(out_ids, count, compact_ids);
+    }
+
+    expected<PreparedBitset>
+    PrepareBitset(BitsetView bitset) const override {
+        return index_node_->PrepareBitset(bitset);
+    }
+
+    Status
+    FinalizeIdMap() override {
+        return index_node_->FinalizeIdMap();
     }
 
     std::string

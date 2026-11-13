@@ -1,5 +1,5 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -11,30 +11,11 @@
 #define FAISS_INDEX_IVF_FLAT_H
 
 #include <stdint.h>
-#include <optional>
 #include <unordered_map>
 
 #include <faiss/IndexIVF.h>
 
-#include "knowhere/object.h"
-
 namespace faiss {
-struct IVFFlatIteratorWorkspace {
-    IVFFlatIteratorWorkspace(
-            const float* query_data,
-            const IVFSearchParameters* search_params)
-            : query_data(query_data), search_params(search_params) {}
-
-    const float* query_data = nullptr; // single query
-    const IVFSearchParameters* search_params = nullptr;
-    size_t nprobe = 0;
-    size_t backup_count_threshold = 0;  // count * nprobe / nlist
-    std::vector<knowhere::DistId> dists;    // should be cleared after each use
-    size_t next_visit_coarse_list_idx = 0;
-    std::unique_ptr<float[]> coarse_dis = nullptr;   // backup coarse centroids distances (heap)
-    std::unique_ptr<idx_t[]> coarse_idx = nullptr;   // backup coarse centroids ids (heap)
-    std::unique_ptr<size_t[]> coarse_list_sizes = nullptr;  // snapshot of the list_size
-};
 
 /** Inverted file with stored vectors. Here the inverted file
  * pre-selects the vectors to be searched, but they are not otherwise
@@ -46,21 +27,11 @@ struct IndexIVFFlat : IndexIVF {
             size_t d,
             size_t nlist_,
             MetricType = METRIC_L2,
-            bool is_cosine = false);
-
-    void restore_codes(const uint8_t* raw_data, const size_t raw_size);
-
-    // Be careful with overriding this function, because
-    //   renormalized x may be used inside.
-    // Overridden by IndexIVFFlatDedup.
-    void train(idx_t n, const float* x) override;
-
-    void add_with_ids(idx_t n, const float* x, const idx_t* xids) override;
+            bool own_invlists = true);
 
     void add_core(
             idx_t n,
             const float* x,
-            const float* x_norms,
             const idx_t* xids,
             const idx_t* precomputed_idx,
             void* inverted_list_context = nullptr) override;
@@ -72,9 +43,16 @@ struct IndexIVFFlat : IndexIVF {
             uint8_t* codes,
             bool include_listnos = false) const override;
 
+    void decode_vectors(
+            idx_t n,
+            const uint8_t* codes,
+            const idx_t* list_nos,
+            float* x) const override;
+
     InvertedListScanner* get_InvertedListScanner(
             bool store_pairs,
-            const IDSelector* sel) const override;
+            const IDSelector* sel,
+            const IVFSearchParameters* params) const override;
 
     void reconstruct_from_offset(int64_t list_no, int64_t offset, float* recons)
             const override;
@@ -82,32 +60,38 @@ struct IndexIVFFlat : IndexIVF {
     void sa_decode(idx_t n, const uint8_t* bytes, float* x) const override;
 
     IndexIVFFlat();
-
-    std::unique_ptr<IVFFlatIteratorWorkspace> getIteratorWorkspace(
-            const float* query_data,
-            const IVFSearchParameters* ivfsearchParams) const;
-
-    // Unlike regular knn-search, the iterator does not know the size `k` of the
-    // returned result.
-    //   The iterator will maintain a heap of at least (nprobe/nlist) nodes for
-    //   iterator `Next()` operation.
-    //   When there are not enough nodes in the heap, iterator will scan the
-    //   next coarse list.
-    void getIteratorNextBatch(
-            IVFFlatIteratorWorkspace* workspace,
-            size_t current_backup_count) const;
 };
 
-struct IndexIVFFlatCC : IndexIVFFlat {
-    IndexIVFFlatCC(
-            Index* quantizer,
-            size_t d,
-            size_t nlist,
-            size_t ssize,
-            MetricType = METRIC_L2,
-            bool is_cosine = false);
+template <typename VectorDistance>
+struct IVFFlatScanner : InvertedListScanner {
+    VectorDistance vd;
+    using C = typename VectorDistance::C;
 
-    IndexIVFFlatCC();
+    IVFFlatScanner(
+            const VectorDistance& vd,
+            bool store_pairs,
+            const IDSelector* sel)
+            : InvertedListScanner(store_pairs, sel), vd(vd) {
+        keep_max = vd.is_similarity;
+        code_size = vd.d * sizeof(float);
+    }
+
+    const float* xi = nullptr;
+    void set_query(const float* query) override {
+        this->xi = query;
+    }
+
+    void set_list(idx_t list_no, float /* coarse_dis */) override {
+        this->list_no = list_no;
+    }
+
+    float distance_to_code(const uint8_t* code) const final;
+
+    size_t scan_codes(
+            size_t list_size,
+            const uint8_t* codes,
+            const idx_t* ids,
+            ResultHandler& handler) const override;
 };
 
 struct IndexIVFFlatDedup : IndexIVFFlat {
@@ -120,7 +104,8 @@ struct IndexIVFFlatDedup : IndexIVFFlat {
             Index* quantizer,
             size_t d,
             size_t nlist_,
-            MetricType = METRIC_L2);
+            MetricType = METRIC_L2,
+            bool own_invlists = true);
 
     /// also dedups the training set
     void train(idx_t n, const float* x) override;

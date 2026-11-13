@@ -11,10 +11,11 @@
 
 #include <unordered_set>
 
+#include "cachinglayer/Manager.h"
 #include "catch2/catch_approx.hpp"
 #include "catch2/catch_test_macros.hpp"
 #include "catch2/generators/catch_generators.hpp"
-#include "faiss/utils/binary_distances.h"
+#include "faiss/cppcontrib/knowhere/utils/binary_distances.h"
 #include "hnswlib/hnswalg.h"
 #include "knowhere/bitsetview.h"
 #include "knowhere/comp/brute_force.h"
@@ -22,6 +23,7 @@
 #include "knowhere/comp/knowhere_config.h"
 #include "knowhere/index/index_factory.h"
 #include "knowhere/log.h"
+#include "simd/hook.h"
 #include "utils.h"
 
 namespace {
@@ -36,8 +38,8 @@ GetIteratorKNNResult(const std::vector<std::shared_ptr<knowhere::IndexNode::iter
     for (int i = 0; i < nq; ++i) {
         auto& iter = iterators[i];
         for (int j = 0; j < k; ++j) {
-            if (iter->HasNext()) {
-                auto [id, dist] = iter->Next();
+            if (iter->HasNext().value()) {
+                auto [id, dist] = iter->Next().value();
                 // if bitset is provided, verify we don't return filtered out points.
                 REQUIRE((!bitset || !bitset->test(id)));
                 p_id[i * k + j] = id;
@@ -65,7 +67,7 @@ AssertBruteForceIteratorResultCorrect(size_t nb,
         size_t j = 0;
         while (j < nb) {
             if (gt_ids[j] == -1) {
-                REQUIRE(!iter.HasNext());
+                REQUIRE(!iter.HasNext().value());
                 break;
             }
             auto dis = gt_dist[j];
@@ -75,8 +77,8 @@ AssertBruteForceIteratorResultCorrect(size_t nb,
             }
             ++j;
             while (!ids_set.empty()) {
-                REQUIRE(iter.HasNext());
-                auto [id, dist] = iter.Next();
+                REQUIRE(iter.HasNext().value());
+                auto [id, dist] = iter.Next().value();
                 REQUIRE(ids_set.find(id) != ids_set.end());
                 REQUIRE(dist == dis);
                 ids_set.erase(id);
@@ -97,7 +99,15 @@ TEST_CASE("Test Iterator Mem Index With Float Vector", "[float metrics]") {
     auto metric = GENERATE(as<std::string>{}, knowhere::metric::L2, knowhere::metric::COSINE, knowhere::metric::IP);
     auto version = GenTestVersionList();
 
-    auto base_gen = [&]() {
+    static const int64_t mb = 1024 * 1024;
+
+    milvus::cachinglayer::Manager::ConfigureTieredStorage(
+        {CacheWarmupPolicy::CacheWarmupPolicy_Disable, CacheWarmupPolicy::CacheWarmupPolicy_Disable,
+         CacheWarmupPolicy::CacheWarmupPolicy_Disable, CacheWarmupPolicy::CacheWarmupPolicy_Disable},
+        {1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb}, true, true, {10, false, 30},
+        std::chrono::milliseconds(1000));
+
+    auto base_gen = [=]() {
         knowhere::Json json;
         json[knowhere::meta::DIM] = dim;
         json[knowhere::meta::METRIC_TYPE] = metric;
@@ -105,27 +115,109 @@ TEST_CASE("Test Iterator Mem Index With Float Vector", "[float metrics]") {
         return json;
     };
 
-    auto hnsw_gen = [&base_gen]() {
+    auto hnsw_gen = [base_gen]() {
         knowhere::Json json = base_gen();
         json[knowhere::indexparam::HNSW_M] = 128;
         json[knowhere::indexparam::EFCONSTRUCTION] = 200;
-        json[knowhere::indexparam::SEED_EF] = 64;
-        json[knowhere::indexparam::EF] = 64;
+        json[knowhere::indexparam::EF] = 80;
         return json;
     };
 
-    auto ivfflat_gen = [&base_gen]() {
+    auto hnsw_sq_gen = [hnsw_gen]() {
+        knowhere::Json json = hnsw_gen();
+        json[knowhere::indexparam::SQ_TYPE] = "SQ8";
+        return json;
+    };
+
+    auto hnsw_sq_refine_flat_gen = [hnsw_sq_gen]() {
+        knowhere::Json json = hnsw_sq_gen();
+        json["refine"] = true;
+        json["refine_type"] = "FLAT";
+        return json;
+    };
+
+    auto hnsw_sq_refine_fp16_gen = [hnsw_sq_gen]() {
+        knowhere::Json json = hnsw_sq_gen();
+        json["refine"] = true;
+        json["refine_type"] = "FP16";
+        return json;
+    };
+
+    auto hnsw_pq_gen = [hnsw_gen]() {
+        knowhere::Json json = hnsw_gen();
+        json[knowhere::indexparam::M] = dim / 8;
+        json[knowhere::indexparam::NBITS] = 6;
+        return json;
+    };
+
+    auto hnsw_pq_refine_flat_gen = [hnsw_pq_gen]() {
+        knowhere::Json json = hnsw_pq_gen();
+        json["refine"] = true;
+        json["refine_type"] = "FLAT";
+        return json;
+    };
+
+    auto hnsw_pq_refine_sq8_gen = [hnsw_pq_gen]() {
+        knowhere::Json json = hnsw_pq_gen();
+        json["refine"] = true;
+        json["refine_type"] = "SQ8";
+        return json;
+    };
+
+    auto hnsw_prq_gen = [hnsw_gen]() {
+        knowhere::Json json = hnsw_gen();
+        json[knowhere::indexparam::M] = dim / 8;
+        json[knowhere::indexparam::PRQ_NUM] = 2;
+        json[knowhere::indexparam::NBITS] = 6;
+        return json;
+    };
+
+    auto ivf_base_gen = [base_gen]() {
         knowhere::Json json = base_gen();
         json[knowhere::indexparam::NPROBE] = 16;
         json[knowhere::indexparam::NLIST] = 24;
         return json;
     };
 
-    auto ivfflatcc_gen = [&base_gen]() {
+    auto ivfflatcc_gen = [base_gen]() {
         knowhere::Json json = base_gen();
         json[knowhere::indexparam::NPROBE] = 16;
         json[knowhere::indexparam::NLIST] = 24;
         json[knowhere::indexparam::SSIZE] = 32;
+        return json;
+    };
+
+    auto ivf_sq_cc_gen = [base_gen]() {
+        knowhere::Json json = base_gen();
+        json[knowhere::indexparam::NPROBE] = 16;
+        json[knowhere::indexparam::NLIST] = 24;
+        json[knowhere::indexparam::SSIZE] = 32;
+        json[knowhere::indexparam::CODE_SIZE] = 8;
+        json[knowhere::indexparam::ENSURE_TOPK_FULL] = false;
+        return json;
+    };
+
+    auto scann_gen = [ivf_base_gen]() {
+        knowhere::Json json = ivf_base_gen();
+        json[knowhere::indexparam::NPROBE] = 14;
+        json[knowhere::indexparam::REORDER_K] = 200;
+        json[knowhere::indexparam::WITH_RAW_DATA] = true;
+        json[knowhere::indexparam::ENSURE_TOPK_FULL] = false;
+        return json;
+    };
+
+    auto scann_gen2 = [ivf_base_gen]() {
+        knowhere::Json json = ivf_base_gen();
+        json[knowhere::indexparam::WITH_RAW_DATA] = false;
+        return json;
+    };
+
+    auto ivfrabitq_gen = ivf_base_gen;
+
+    auto ivfrabitq_refine_flat_gen = [ivfrabitq_gen] {
+        knowhere::Json json = ivfrabitq_gen();
+        json["refine"] = true;
+        json["refine_type"] = "FLAT";
         return json;
     };
 
@@ -134,53 +226,131 @@ TEST_CASE("Test Iterator Mem Index With Float Vector", "[float metrics]") {
     const auto train_ds = GenDataSet(nb, dim, rand);
     const auto query_ds = GenDataSet(nq, dim, rand + 777);
 
+    // certain unit tests are disabled, because they are way too slow at this moment
+    // todo: re-enable later
     SECTION("Test Search using iterator") {
         using std::make_tuple;
         auto [name, gen] = GENERATE_REF(table<std::string, std::function<knowhere::Json()>>(
-            {make_tuple(knowhere::IndexEnum::INDEX_HNSW, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ8, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ8_REFINE, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, ivfflat_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC, ivfflatcc_gen)}));
+            {make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, ivf_base_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC, ivfflatcc_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFSQ8, ivf_base_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFSQ_CC, ivf_sq_cc_gen),
+#ifdef KNOWHERE_WITH_CARDINAL
+             make_tuple(knowhere::IndexEnum::INDEX_CARDINAL_TIERED, hnsw_gen),
+#endif
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW, hnsw_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_refine_flat_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_refine_fp16_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_refine_flat_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_refine_sq8_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_PRQ, hnsw_prq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_SCANN, scann_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_SCANN, scann_gen2),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFRABITQ, ivfrabitq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFRABITQ, ivfrabitq_refine_flat_gen)}));
+        if (name == knowhere::IndexEnum::INDEX_FAISS_SCANN && !faiss::cppcontrib::knowhere::support_pq_fast_scan) {
+            SKIP("SCANN requires PQ fast-scan SIMD support");
+        }
         auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(name, version).value();
         auto cfg_json = gen().dump();
         CAPTURE(name, cfg_json);
         knowhere::Json json = knowhere::Json::parse(cfg_json);
         REQUIRE(idx.Type() == name);
-        REQUIRE(idx.Build(*train_ds, json) == knowhere::Status::success);
+        REQUIRE(idx.Build(train_ds, json) == knowhere::Status::success);
         REQUIRE(idx.Size() > 0);
         REQUIRE(idx.Count() == nb);
 
         knowhere::BinarySet bs;
         REQUIRE(idx.Serialize(bs) == knowhere::Status::success);
         REQUIRE(idx.Deserialize(bs) == knowhere::Status::success);
-        auto its = idx.AnnIterator(*query_ds, json, nullptr);
+        auto its = idx.AnnIterator(query_ds, json, nullptr);
         REQUIRE(its.has_value());
 
         // compare iterator_search results with normal ann search results
         // the iterator resutls should not be too bad.
         auto iterator_results = GetIteratorKNNResult(its.value(), topk);
-        auto search_results = idx.Search(*query_ds, json, nullptr);
+        auto search_results = idx.Search(query_ds, json, nullptr);
         REQUIRE(search_results.has_value());
         bool dist_less_better = knowhere::IsMetricType(metric, knowhere::metric::L2);
         float recall = GetKNNRelativeRecall(*search_results.value(), *iterator_results, dist_less_better);
         REQUIRE(recall > kKnnRecallThreshold);
     }
 
+#ifdef KNOWHERE_WITH_CARDINAL
+    // currently, only cardinal support iterator_retain_order
+    SECTION("Test Search with ordered Iterator") {
+        using std::make_tuple;
+        auto [name, gen] = GENERATE_REF(table<std::string, std::function<knowhere::Json()>>(
+            {make_tuple(knowhere::IndexEnum::INDEX_HNSW, hnsw_gen)}));
+        auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(name, version).value();
+        auto cfg_json = gen().dump();
+        CAPTURE(name, cfg_json);
+        knowhere::Json json = knowhere::Json::parse(cfg_json);
+        // set `retain_iterator_order` to true.
+        json[knowhere::meta::RETAIN_ITERATOR_ORDER] = true;
+
+        REQUIRE(idx.Type() == name);
+        REQUIRE(idx.Build(train_ds, json) == knowhere::Status::success);
+        auto its = idx.AnnIterator(query_ds, json, nullptr);
+        REQUIRE(its.has_value());
+
+        bool dist_less_better = knowhere::IsMetricType(metric, knowhere::metric::L2);
+        auto is_first_closer_or_equal = [&dist_less_better](float a, float b) {
+            return dist_less_better ? a <= b : a >= b;
+        };
+
+        // next_dist should not be closer.
+        for (int i = 0; i < nq; ++i) {
+            auto& iter = its.value()[i];
+            float last_dist;
+            if (iter->HasNext().value()) {
+                auto [id, dist] = iter->Next().value();
+                last_dist = dist;
+            } else {
+                continue;
+            }
+
+            while (iter->HasNext().value()) {
+                auto [id, dist] = iter->Next().value();
+                REQUIRE(is_first_closer_or_equal(last_dist, dist));
+                last_dist = dist;
+            }
+        }
+    }
+#endif
+
+    // certain unit tests are disabled, because they are way too slow at this moment
+    // todo: re-enable later
     SECTION("Test Search with Bitset using iterator") {
         using std::make_tuple;
         auto [name, gen] = GENERATE_REF(table<std::string, std::function<knowhere::Json()>>(
-            {make_tuple(knowhere::IndexEnum::INDEX_HNSW, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ8, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ8_REFINE, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, ivfflat_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC, ivfflatcc_gen)}));
+            {make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, ivf_base_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC, ivfflatcc_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFSQ8, ivf_base_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFSQ_CC, ivf_sq_cc_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW, hnsw_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_refine_flat_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_refine_fp16_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_refine_flat_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_refine_sq8_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_PRQ, hnsw_prq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_SCANN, scann_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_SCANN, scann_gen2),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFRABITQ, ivfrabitq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFRABITQ, ivfrabitq_refine_flat_gen)}));
+        if (name == knowhere::IndexEnum::INDEX_FAISS_SCANN && !faiss::cppcontrib::knowhere::support_pq_fast_scan) {
+            SKIP("SCANN requires PQ fast-scan SIMD support");
+        }
         auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(name, version).value();
         auto cfg_json = gen().dump();
         CAPTURE(name, cfg_json);
         knowhere::Json json = knowhere::Json::parse(cfg_json);
         REQUIRE(idx.Type() == name);
-        REQUIRE(idx.Build(*train_ds, json) == knowhere::Status::success);
+        REQUIRE(idx.Build(train_ds, json) == knowhere::Status::success);
 
         std::vector<std::function<std::vector<uint8_t>(size_t, size_t)>> gen_bitset_funcs = {
             GenerateBitsetWithFirstTbitsSet, GenerateBitsetWithRandomTbitsSet};
@@ -190,11 +360,11 @@ TEST_CASE("Test Iterator Mem Index With Float Vector", "[float metrics]") {
                 auto bitset_data = gen_func(nb, percentage * nb);
                 knowhere::BitsetView bitset(bitset_data.data(), nb);
                 // Iterator doesn't have a fallback to bruteforce mechanism at high filter rate.
-                auto its = idx.AnnIterator(*query_ds, json, bitset);
+                auto its = idx.AnnIterator(query_ds, json, bitset);
                 REQUIRE(its.has_value());
 
                 auto iterator_results = GetIteratorKNNResult(its.value(), topk);
-                auto search_results = idx.Search(*query_ds, json, bitset);
+                auto search_results = idx.Search(query_ds, json, bitset);
                 REQUIRE(search_results.has_value());
                 bool dist_less_better = knowhere::IsMetricType(metric, knowhere::metric::L2);
                 float recall = GetKNNRelativeRecall(*search_results.value(), *iterator_results, dist_less_better);
@@ -203,20 +373,97 @@ TEST_CASE("Test Iterator Mem Index With Float Vector", "[float metrics]") {
         }
     }
 
-    SECTION("Test Search with Bitset using iterator insufficient results") {
+    // At high filter ratios the HNSW iterator scans the unfiltered points instead of traversing the graph,
+    //   so it must return every unfiltered point, in the same order as a brute-force kNN search.
+    SECTION("Test HNSW iterator falls back to brute force at high filter ratio") {
         using std::make_tuple;
         auto [name, gen] = GENERATE_REF(table<std::string, std::function<knowhere::Json()>>(
             {make_tuple(knowhere::IndexEnum::INDEX_HNSW, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ8, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ8_REFINE, hnsw_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, ivfflat_gen),
-             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC, ivfflatcc_gen)}));
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_refine_flat_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_refine_flat_gen)}));
         auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(name, version).value();
         auto cfg_json = gen().dump();
         CAPTURE(name, cfg_json);
         knowhere::Json json = knowhere::Json::parse(cfg_json);
         REQUIRE(idx.Type() == name);
-        REQUIRE(idx.Build(*train_ds, json) == knowhere::Status::success);
+        REQUIRE(idx.Build(train_ds, json) == knowhere::Status::success);
+
+        // HNSW (flat) and refined indexes scan with exact distances.
+        const bool is_exact = (name == knowhere::IndexEnum::INDEX_HNSW) || json.value("refine", false);
+        std::vector<std::function<std::vector<uint8_t>(size_t, size_t)>> gen_bitset_funcs = {
+            GenerateBitsetWithFirstTbitsSet, GenerateBitsetWithRandomTbitsSet};
+        const auto bitset_percentages = {0.98f, 0.99f};
+        for (const float percentage : bitset_percentages) {
+            for (const auto& gen_func : gen_bitset_funcs) {
+                const size_t n_filtered = percentage * nb;
+                auto bitset_data = gen_func(nb, n_filtered);
+                knowhere::BitsetView bitset(bitset_data.data(), nb);
+                const size_t n_unfiltered = nb - n_filtered;
+
+                // reference: exact brute force for the exact indexes, and the index's own kNN Search for the
+                //   quantized ones (which brute-forces over the same quantized storage at this filter ratio).
+                auto ref = is_exact ? knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, json, bitset)
+                                    : idx.Search(query_ds, json, bitset);
+                REQUIRE(ref.has_value());
+                const auto ref_ids = ref.value()->GetIds();
+                const size_t expected_k = std::min<size_t>(topk, n_unfiltered);
+
+                auto its = idx.AnnIterator(query_ds, json, bitset);
+                REQUIRE(its.has_value());
+                size_t n_hit = 0;
+                for (int64_t i = 0; i < nq; ++i) {
+                    auto& it = its.value()[i];
+                    std::unordered_set<int64_t> ref_topk(ref_ids + i * topk, ref_ids + i * topk + expected_k);
+                    // every unfiltered point is reachable through the iterator.
+                    size_t n_returned = 0;
+                    while (it->HasNext().value()) {
+                        auto [id, dist] = it->Next().value();
+                        REQUIRE(!bitset.test(id));
+                        if (n_returned < expected_k && ref_topk.count(id) > 0) {
+                            n_hit++;
+                        }
+                        n_returned++;
+                    }
+                    REQUIRE(n_returned == n_unfiltered);
+                }
+                const float recall = static_cast<float>(n_hit) / (nq * expected_k);
+                REQUIRE(recall >= 0.98f);
+            }
+        }
+    }
+
+    // certain unit tests are disabled, because they are way too slow at this moment
+    // todo: re-enable later
+    SECTION("Test Search with Bitset using iterator insufficient results") {
+        using std::make_tuple;
+        auto [name, gen] = GENERATE_REF(table<std::string, std::function<knowhere::Json()>>(
+            {make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT, ivf_base_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFFLAT_CC, ivfflatcc_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFSQ8, ivf_base_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFSQ_CC, ivf_sq_cc_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW, hnsw_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_refine_flat_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_SQ, hnsw_sq_refine_fp16_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_refine_flat_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_PQ, hnsw_pq_refine_sq8_gen),
+             // make_tuple(knowhere::IndexEnum::INDEX_HNSW_PRQ, hnsw_prq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_SCANN, scann_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_SCANN, scann_gen2),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFRABITQ, ivfrabitq_gen),
+             make_tuple(knowhere::IndexEnum::INDEX_FAISS_IVFRABITQ, ivfrabitq_refine_flat_gen)}));
+        if (name == knowhere::IndexEnum::INDEX_FAISS_SCANN && !faiss::cppcontrib::knowhere::support_pq_fast_scan) {
+            SKIP("SCANN requires PQ fast-scan SIMD support");
+        }
+        auto idx = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(name, version).value();
+        auto cfg_json = gen().dump();
+        CAPTURE(name, cfg_json);
+        knowhere::Json json = knowhere::Json::parse(cfg_json);
+        REQUIRE(idx.Type() == name);
+        REQUIRE(idx.Build(train_ds, json) == knowhere::Status::success);
 
         std::vector<std::function<std::vector<uint8_t>(size_t, size_t)>> gen_bitset_funcs = {
             GenerateBitsetWithFirstTbitsSet, GenerateBitsetWithRandomTbitsSet};
@@ -225,14 +472,14 @@ TEST_CASE("Test Iterator Mem Index With Float Vector", "[float metrics]") {
         for (const auto& gen_func : gen_bitset_funcs) {
             auto bitset_data = gen_func(nb, nb - filter_remaining);
             knowhere::BitsetView bitset(bitset_data.data(), nb);
-            auto its = idx.AnnIterator(*query_ds, json, bitset);
+            auto its = idx.AnnIterator(query_ds, json, bitset);
             REQUIRE(its.has_value());
             auto iterator_results = GetIteratorKNNResult(its.value(), topk);
             // after get those remaining points, iterator should return false for HasNext.
             for (const auto& it : its.value()) {
-                REQUIRE(!it->HasNext());
+                REQUIRE(!it->HasNext().value());
             }
-            auto search_results = idx.Search(*query_ds, json, bitset);
+            auto search_results = idx.Search(query_ds, json, bitset);
             REQUIRE(search_results.has_value());
             bool dist_less_better = knowhere::IsMetricType(metric, knowhere::metric::L2);
             float recall = GetKNNRelativeRecall(*search_results.value(), *iterator_results, dist_less_better);
@@ -253,7 +500,7 @@ TEST_CASE("Test Iterator IVFFlatCC With Newly Insert Vectors", "[float metrics] 
     auto metric = GENERATE(as<std::string>{}, knowhere::metric::L2, knowhere::metric::COSINE, knowhere::metric::IP);
     auto version = GenTestVersionList();
 
-    auto base_gen = [&]() {
+    auto base_gen = [=]() {
         knowhere::Json json;
         json[knowhere::meta::DIM] = dim;
         json[knowhere::meta::METRIC_TYPE] = metric;
@@ -261,7 +508,7 @@ TEST_CASE("Test Iterator IVFFlatCC With Newly Insert Vectors", "[float metrics] 
         return json;
     };
 
-    auto ivfflatcc_gen = [&base_gen]() {
+    auto ivfflatcc_gen = [base_gen]() {
         knowhere::Json json = base_gen();
         json[knowhere::indexparam::NPROBE] = 16;
         json[knowhere::indexparam::NLIST] = 24;
@@ -285,17 +532,17 @@ TEST_CASE("Test Iterator IVFFlatCC With Newly Insert Vectors", "[float metrics] 
 
         knowhere::Json json = knowhere::Json::parse(cfg_json);
         REQUIRE(idx.Type() == name);
-        REQUIRE(idx.Build(*train_ds, json) == knowhere::Status::success);
+        REQUIRE(idx.Build(train_ds, json) == knowhere::Status::success);
         REQUIRE(idx.Size() > 0);
 
         REQUIRE(idx.Count() == nb);
-        auto its_old = idx.AnnIterator(*query_ds, json, nullptr);
+        auto its_old = idx.AnnIterator(query_ds, json, nullptr);
         REQUIRE(its_old.has_value());
         auto& iters_old = its_old.value();
 
-        REQUIRE(idx.Add(*train_ds_new, json) == knowhere::Status::success);
+        REQUIRE(idx.Add(train_ds_new, json) == knowhere::Status::success);
         REQUIRE(idx.Count() == nb + nb_new);
-        auto its_new = idx.AnnIterator(*query_ds, json, nullptr);
+        auto its_new = idx.AnnIterator(query_ds, json, nullptr);
         REQUIRE(its_new.has_value());
         auto& iters_new = its_new.value();
 
@@ -303,8 +550,8 @@ TEST_CASE("Test Iterator IVFFlatCC With Newly Insert Vectors", "[float metrics] 
         for (int i = 0; i < iters_old.size(); ++i) {
             auto& iter = iters_old[i];
             for (int j = 0; j < nb; ++j) {
-                REQUIRE(iter->HasNext());
-                auto [id, dist] = iter->Next();
+                REQUIRE(iter->HasNext().value());
+                auto [id, dist] = iter->Next().value();
                 REQUIRE(id < nb);
             }
         }
@@ -314,8 +561,8 @@ TEST_CASE("Test Iterator IVFFlatCC With Newly Insert Vectors", "[float metrics] 
             auto& iter = iters_new[i];
             bool id_larger_than_nb = false;
             for (int j = 0; j < nb + nb_new; ++j) {
-                REQUIRE(iter->HasNext());
-                auto [id, dist] = iter->Next();
+                REQUIRE(iter->HasNext().value());
+                auto [id, dist] = iter->Next().value();
                 id_larger_than_nb |= id >= nb;
             }
             REQUIRE(id_larger_than_nb);
@@ -333,7 +580,7 @@ TEST_CASE("Test Iterator Mem Index With Binary Metrics", "[binary metrics]") {
     auto metric = GENERATE(as<std::string>{}, knowhere::metric::HAMMING, knowhere::metric::JACCARD);
     auto version = GenTestVersionList();
 
-    auto base_gen = [&]() {
+    auto base_gen = [=]() {
         knowhere::Json json;
         json[knowhere::meta::DIM] = dim;
         json[knowhere::meta::METRIC_TYPE] = metric;
@@ -341,11 +588,11 @@ TEST_CASE("Test Iterator Mem Index With Binary Metrics", "[binary metrics]") {
         return json;
     };
 
-    auto hnsw_gen = [&base_gen]() {
+    auto hnsw_gen = [base_gen]() {
         knowhere::Json json = base_gen();
         json[knowhere::indexparam::HNSW_M] = 128;
         json[knowhere::indexparam::EFCONSTRUCTION] = 200;
-        json[knowhere::indexparam::SEED_EF] = 64;
+        json[knowhere::indexparam::EF] = 64;
         return json;
     };
     const auto train_ds = GenBinDataSet(nb, dim);
@@ -356,6 +603,7 @@ TEST_CASE("Test Iterator Mem Index With Binary Metrics", "[binary metrics]") {
         {knowhere::meta::TOPK, topk},
     };
 
+#ifdef KNOWHERE_WITH_CARDINAL
     auto gt = knowhere::BruteForce::Search<knowhere::bin1>(train_ds, query_ds, conf, nullptr);
     SECTION("Test Search using iterator") {
         using std::make_tuple;
@@ -367,20 +615,21 @@ TEST_CASE("Test Iterator Mem Index With Binary Metrics", "[binary metrics]") {
         CAPTURE(name, cfg_json);
         knowhere::Json json = knowhere::Json::parse(cfg_json);
         REQUIRE(idx.Type() == name);
-        REQUIRE(idx.Build(*train_ds, json) == knowhere::Status::success);
+        REQUIRE(idx.Build(train_ds, json) == knowhere::Status::success);
         REQUIRE(idx.Size() > 0);
         REQUIRE(idx.Count() == nb);
 
-        auto its = idx.AnnIterator(*query_ds, json, nullptr);
+        auto its = idx.AnnIterator(query_ds, json, nullptr);
         REQUIRE(its.has_value());
 
         auto iterator_results = GetIteratorKNNResult(its.value(), topk);
-        auto search_results = idx.Search(*query_ds, json, nullptr);
+        auto search_results = idx.Search(query_ds, json, nullptr);
         REQUIRE(search_results.has_value());
         bool dist_less_better = knowhere::IsMetricType(metric, knowhere::metric::L2);
         float recall = GetKNNRelativeRecall(*search_results.value(), *iterator_results, dist_less_better);
         REQUIRE(recall > kKnnRecallThreshold);
     }
+#endif
 }
 
 TEST_CASE("Test Iterator BruteForce With Float Vector", "[float metrics]") {
@@ -430,7 +679,7 @@ TEST_CASE("Test Iterator BruteForce With Sparse Float Vector", "[IP metric]") {
     const int64_t nb = 1000, nq = 10;
     const int64_t dim = 4;
 
-    auto metric = knowhere::metric::IP;
+    auto metric = GENERATE(knowhere::metric::IP, knowhere::metric::BM25);
     auto version = GenTestVersionList();
 
     auto rand = GENERATE(1, 2, 3, 5);
@@ -440,6 +689,7 @@ TEST_CASE("Test Iterator BruteForce With Sparse Float Vector", "[IP metric]") {
 
     const knowhere::Json conf = {
         {knowhere::meta::METRIC_TYPE, metric}, {knowhere::meta::TOPK, nb},  // to return all vectors
+        {knowhere::meta::BM25_K1, 1.2},        {knowhere::meta::BM25_B, 0.75}, {knowhere::meta::BM25_AVGDL, 100},
     };
 
     SECTION("Test Iterator BruteForce") {
@@ -463,6 +713,102 @@ TEST_CASE("Test Iterator BruteForce With Sparse Float Vector", "[IP metric]") {
                                      .value();
                 auto gt = knowhere::BruteForce::SearchSparse(train_ds, query_ds, conf, bitset);
                 AssertBruteForceIteratorResultCorrect(nb, iterators, gt.value());
+            }
+        }
+    }
+}
+
+TEST_CASE("Test Scann with data view refiner", "[float metrics]") {
+    using Catch::Approx;
+    if (!faiss::cppcontrib::knowhere::support_pq_fast_scan) {
+        SKIP("pass scann test");
+    }
+    auto version = GenTestVersionList();
+
+    const int64_t nb = 1000, nq = 10;
+    auto metric = GENERATE(as<std::string>{}, knowhere::metric::IP, knowhere::metric::COSINE, knowhere::metric::L2);
+    auto topk = GENERATE(as<int64_t>{}, 10);
+    auto dim = GENERATE(as<int64_t>{}, 120);
+
+    auto base_gen = [=]() {
+        knowhere::Json json;
+        json[knowhere::meta::DIM] = dim;
+        json[knowhere::meta::METRIC_TYPE] = metric;
+        json[knowhere::meta::TOPK] = topk;
+        json[knowhere::meta::RADIUS] = knowhere::IsMetricType(metric, knowhere::metric::L2) ? 10.0 : 0.99;
+        json[knowhere::meta::RANGE_FILTER] = knowhere::IsMetricType(metric, knowhere::metric::L2) ? 0.0 : 1.01;
+        return json;
+    };
+
+    auto scann_gen = [base_gen, topk]() {
+        knowhere::Json json = base_gen();
+        json[knowhere::indexparam::NLIST] = 16;
+        json[knowhere::indexparam::NPROBE] = 14;
+        json[knowhere::indexparam::REFINE_RATIO] = 4.0;
+        json[knowhere::indexparam::SUB_DIM] = 2;
+        json[knowhere::indexparam::WITH_RAW_DATA] = true;
+        return json;
+    };
+
+    auto rand = GENERATE(1, 2);
+    const auto train_ds = GenDataSet(nb, dim, rand);
+    const auto query_ds = GenDataSet(nq, dim, rand + 777);
+
+    const knowhere::Json conf = {
+        {knowhere::meta::METRIC_TYPE, metric},
+        {knowhere::meta::TOPK, topk},
+    };
+    auto gt = knowhere::BruteForce::Search<knowhere::fp32>(train_ds, query_ds, conf, nullptr);
+    knowhere::ViewDataOp data_view = [&train_ds, data_size = sizeof(float) * dim](size_t id) {
+        auto data = train_ds->GetTensor();
+        return (const void*)((const char*)data + data_size * id);
+    };
+    auto data_view_pack = knowhere::Pack(data_view);
+    auto cfg_json = scann_gen().dump();
+    knowhere::Json json = knowhere::Json::parse(cfg_json);
+
+    auto scann_with_dv_refiner =
+        knowhere::IndexFactory::Instance()
+            .Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_FAISS_SCANN_DVR, version, data_view_pack)
+            .value();
+
+    REQUIRE(scann_with_dv_refiner.Type() == knowhere::IndexEnum::INDEX_FAISS_SCANN_DVR);
+    REQUIRE(scann_with_dv_refiner.Build(train_ds, json) == knowhere::Status::success);
+    REQUIRE(scann_with_dv_refiner.Count() == nb);
+    REQUIRE(scann_with_dv_refiner.Size() > 0);
+    REQUIRE(scann_with_dv_refiner.HasRawData(metric) == false);
+    REQUIRE(scann_with_dv_refiner.HasRawData(metric) ==
+            knowhere::IndexStaticFaced<knowhere::fp32>::HasRawData(knowhere::IndexEnum::INDEX_FAISS_SCANN_DVR, version,
+                                                                   cfg_json));
+
+    SECTION("iterator without bitset") {
+        auto scann_with_dv_its = scann_with_dv_refiner.AnnIterator(query_ds, json, nullptr);
+        REQUIRE(scann_with_dv_its.has_value());
+        auto scann_with_ds_iterator_results = GetIteratorKNNResult(scann_with_dv_its.value(), topk);
+
+        auto search_results = scann_with_dv_refiner.Search(query_ds, json, nullptr);
+        bool dist_less_better = knowhere::IsMetricType(metric, knowhere::metric::L2);
+        float recall = GetKNNRelativeRecall(*search_results.value(), *scann_with_ds_iterator_results, dist_less_better);
+        REQUIRE(recall > kKnnRecallThreshold);
+    }
+    SECTION("iterator with bitset") {
+        std::vector<std::function<std::vector<uint8_t>(size_t, size_t)>> gen_bitset_funcs = {
+            GenerateBitsetWithFirstTbitsSet, GenerateBitsetWithRandomTbitsSet};
+        const auto bitset_percentages = {0.4f, 0.98f};
+        for (const float percentage : bitset_percentages) {
+            for (const auto& gen_func : gen_bitset_funcs) {
+                auto bitset_data = gen_func(nb, percentage * nb);
+                knowhere::BitsetView bitset(bitset_data.data(), nb);
+                // Iterator doesn't have a fallback to bruteforce mechanism at high filter rate.
+                auto its = scann_with_dv_refiner.AnnIterator(query_ds, json, bitset);
+                REQUIRE(its.has_value());
+
+                auto iterator_results = GetIteratorKNNResult(its.value(), topk);
+                auto search_results = scann_with_dv_refiner.Search(query_ds, json, bitset);
+                REQUIRE(search_results.has_value());
+                bool dist_less_better = knowhere::IsMetricType(metric, knowhere::metric::L2);
+                float recall = GetKNNRelativeRecall(*search_results.value(), *iterator_results, dist_less_better);
+                REQUIRE(recall > kKnnRecallThreshold);
             }
         }
     }

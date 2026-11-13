@@ -1,5 +1,5 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -60,6 +61,9 @@ std::vector<float> randVecs(size_t num, size_t dim);
 /// Generates a collection of random bit vectors
 std::vector<unsigned char> randBinaryVecs(size_t num, size_t dim);
 
+// returns to_fp32(to_fp16(v)); useful in comparing fp16 results on CPU
+std::vector<float> roundToHalf(const std::vector<float>& v);
+
 /// Compare two indices via query for similarity, with a user-specified set of
 /// query vectors
 void compareIndices(
@@ -90,9 +94,9 @@ void compareIndices(
 /// Display specific differences in the two (distance, index) lists
 void compareLists(
         const float* refDist,
-        const faiss::Index::idx_t* refInd,
+        const faiss::idx_t* refInd,
         const float* testDist,
-        const faiss::Index::idx_t* testInd,
+        const faiss::idx_t* testInd,
         int dim1,
         int dim2,
         const std::string& configMsg,
@@ -127,16 +131,38 @@ void testIVFEquality(A& cpuIndex, B& gpuIndex) {
         EXPECT_EQ(cpuCodes, gpuCodes);
 
         // Index equality
-        std::vector<Index::idx_t> cpuIndices(cpuLists->list_size(i));
+        std::vector<idx_t> cpuIndices(cpuLists->list_size(i));
 
         auto si = faiss::InvertedLists::ScopedIds(cpuLists, i);
         std::memcpy(
                 cpuIndices.data(),
                 si.get(),
-                cpuLists->list_size(i) * sizeof(faiss::Index::idx_t));
+                cpuLists->list_size(i) * sizeof(faiss::idx_t));
         EXPECT_EQ(cpuIndices, gpuIndex.getListIndices(i));
     }
 }
+
+/// Run search with the given search_params and verify all returned labels are
+/// members of the selector. Works with any Index that supports search with
+/// SearchParameters.
+void testIDSelectorSearch(
+        faiss::Index* index,
+        faiss::SearchParameters* search_params,
+        const std::vector<float>& queryVecs,
+        int numQuery,
+        int k,
+        const std::string& selectorName);
+
+// Structure to hold all IDSelector instances
+struct TestIDSelectorStruct {
+    // Storage for selectors that need it
+    std::vector<faiss::idx_t> array_ids;
+    std::vector<faiss::idx_t> batch_ids;
+    std::vector<uint8_t> bitmap;
+    std::map<std::string, std::unique_ptr<faiss::IDSelector>> selector_map;
+
+    explicit TestIDSelectorStruct(int numAdd);
+};
 
 } // namespace gpu
 } // namespace faiss

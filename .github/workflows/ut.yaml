@@ -14,167 +14,127 @@ on:
       - "thirdparty/**"
       - "benchmark/**"
       - "cmake/**"
+      - "!cmake/libs/libcardinal.cmake"
       - ".github/workflows/ut.yaml"
+      - ".github/actions/**"
       - "CMakeLists.txt"
+      - "Makefile"
+      - "conanfile.py"
+      - "scripts/**"
       - "!**.md"
       - "tests/**"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  ut:
-    name: ut on ubuntu-20.04
-    runs-on: ubuntu-20.04
-    timeout-minutes: 90
+  ut-linux:
+    name: ut on ubuntu-22.04
+    runs-on: self-hosted
+    timeout-minutes: 120
     strategy:
       fail-fast: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'none'
       - name: Install Dependency
         run: |
-          sudo apt update \
-          && sudo apt install -y cmake g++ gcc libopenblas-dev libcurl4-openssl-dev libaio-dev libevent-dev python3 python3-pip lcov \
-          && pip3 install conan==1.61.0 \
-          && conan remote add default-conan-local https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local
-      - name: Download Conan Artifact
-        uses: actions/download-artifact@v4
+          bash scripts/install_deps.sh
+          sudo pip3 install cmake==3.28.1
+      - name: Restore Cache
+        uses: ./.github/actions/cache-restore
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # this run-id is got from a successful "Upload Conan Artifact" workflow run on 2024/03/18,
-          # it will be valid till 2024/06/17
-          run-id: 8322823477
-          name: conan-asan
-          path: downloaded
-        continue-on-error: true
-      - name: Unpack Conan Data
-        run: |
-          if [ -f downloaded/conan.tar.gz ]; then
-            echo "download conan.tar.gz successfully"
-            cd downloaded \
-            && tar xfz conan.tar.gz \
-            && rm -rf conan.tar.gz /home/runner/.conan \
-            && mv ./.conan /home/runner/.conan
-          else
-            echo "download conan.tar.gz fail"
-          fi
+          os: ubuntu-22.04
       - name: Build
         run: |
-          mkdir build && cd build \
-          && conan install .. --build=missing -s build_type=Release -o with_ut=True -o with_diskann=True -o with_asan=True -o with_coverage=True \
-          && conan build ..
-#      - name: Pack Conan Data
-#        run: |
-#          cd /home/runner && tar cfz conan.tar.gz .conan/
-#      - name: Upload Conan Artifact
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: conan-asan
-#          path: /home/runner/conan.tar.gz
-      - name: Run
-        run: |
-          ./scripts/run_codecov.sh
-      - name: Archive result
-        uses: actions/upload-artifact@v4
+          make WITH_UT=True WITH_ASAN=True
+          make test
+      - name: Save Cache
+        uses: ./.github/actions/cache-save
         with:
-          name: codecov-result
-          path: |
-            ./lcov_output.info
-            *.info
-            *.out
-  codecov:
-    name: Upload Code Coverage
-    needs: [ut]
-    runs-on: ubuntu-20.04
-    timeout-minutes: 5
+          os: ubuntu-22.04
+
+  ut-macos:
+    name: ut on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15]
     steps:
-      - name: Download code coverage results
-        uses: actions/download-artifact@v4.1.0
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          name: codecov-result
-      - name: Display structure of code coverage results
+          submodules: 'none'
+      - name: Install Dependency
         run: |
-          ls -lah
-      - name: Upload coverage to Codecov
-        if: "github.repository == 'zilliztech/knowhere'"
-        uses: codecov/codecov-action@v4
-        id: upload_cov
+          bash scripts/install_deps.sh
+      - name: Restore Cache
+        uses: ./.github/actions/cache-restore
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./lcov_output.info
-          name: ubuntu-20.04-unittests
-          fail_ci_if_error: true
-      - name: Retry Upload coverage to Codecov
-        if: "${{ failure() }} && github.repository == 'zilliztech/knowhere'"
-        uses: codecov/codecov-action@v4
-        id: retry_upload_cov
+          os: ${{ matrix.os }}
+      - name: Build
+        run: |
+          # CMake 4.x (Homebrew) removed compat with cmake_minimum_required < 3.5;
+          # some Conan recipes (e.g. bzip2/1.0.8) still use older values.
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          make WITH_UT=True
+      - name: Test
+        run: |
+          make test
+      - name: Save Cache
+        uses: ./.github/actions/cache-save
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./lcov_output.info
-          name: ubuntu-20.04-unittests
-          fail_ci_if_error: true
+          os: ${{ matrix.os }}
 
   swig-build:
     name: python3 wheel
-    runs-on: ubuntu-20.04
-    timeout-minutes: 60
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'none'
       - name: Setup Python
         uses: actions/setup-python@v2
         with:
-          python-version: "3.8"
+          python-version: "3.10"
       - name: Install Dependency
         run: |
-          sudo apt update \
-          && sudo apt install -y cmake g++ gcc libopenblas-dev libaio-dev libcurl4-openssl-dev libevent-dev libgflags-dev python3 python3-pip python3-setuptools \
-          && pip3 install conan==1.61.0 pytest faiss-cpu numpy wheel \
-          && pip3 install bfloat16 \
-          && conan remote add default-conan-local https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local
-      - name: Download Conan Artifact
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # this run-id is got from a successful "Upload Conan Artifact" workflow run on 2024/03/18,
-          # it will be valid till 2024/06/17
-          run-id: 8322823477
-          name: conan-wheel
-          path: downloaded
-        continue-on-error: true
-      - name: Unpack Conan Data
+          bash scripts/install_deps.sh
+          python -m pip install pytest 'numpy>=2,<3' ml-dtypes faiss-cpu
+      - name: Install GCC 12
+        # GCC 11 (ubuntu-22.04 default) has incomplete C++20 support:
+        # std::partial_ordering, std::strong_ordering, std::weak_ordering
+        # from <compare> are not available, causing abseil build failures.
         run: |
-          if [ -f downloaded/conan.tar.gz ]; then
-            echo "download conan.tar.gz successfully"
-            cd downloaded \
-            && tar xfz conan.tar.gz \
-            && rm -rf conan.tar.gz /home/runner/.conan \
-            && mv ./.conan /home/runner/.conan
-          else
-            echo "download conan.tar.gz fail"
-          fi
+          sudo apt-get update
+          sudo apt-get install -y gcc-12 g++-12
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 120
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 120
+          conan profile detect --force
+      - name: Restore Cache
+        uses: ./.github/actions/cache-restore
+        with:
+          os: ubuntu-22.04
       - name: Build
         run: |
-          mkdir build \
-          && cd build \
-          && conan install .. --build=missing -o with_diskann=True -s compiler.libcxx=libstdc++11 -s build_type=Release \
-          && conan build ..
-#      - name: Pack Conan Data
-#        run: |
-#          cd /home/runner && tar cfz conan.tar.gz .conan/
-#      - name: Upload Conan Artifact
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: conan-wheel
-#          path: /home/runner/conan.tar.gz
-      - name: Swig Build
+          make
+      - name: Save Cache
+        uses: ./.github/actions/cache-save
+        with:
+          os: ubuntu-22.04
+      - name: Build Portable Wheel
         run: |
-          cd python && python3 setup.py bdist_wheel
-      - name: Install pips
+          cd python && ./build_portable_wheel.sh
+      - name: Install Wheel
         run: |
-          cd python && pip3 install dist/*.whl
+          cd python && pip3 install dist/*-manylinux*.whl
       - name: Test
         run: |
-          pytest tests/python/test_index_with_random.py
+          python -m pytest tests/python/test_index_with_random.py

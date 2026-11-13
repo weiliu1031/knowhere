@@ -60,9 +60,9 @@ fi
 
 # run unittest
 for test in `ls ${KNOWHERE_UNITTEST_DIR}/*test*`; do
-    echo "Running unittest: ${KNOWHERE_UNITTEST_DIR}/$test"
+    echo "Running unittest: $test"
     # run unittest
-    ${test}
+    ${test} --durations=yes
     if [ $? -ne 0 ]; then
         echo ${args}
         echo ${test} "run failed"
@@ -83,7 +83,7 @@ fi
 # remove unnecessary info
 ${LCOV_CMD} -r "${FILE_INFO_COMBINE}" -o "${FILE_INFO_OUTPUT}" \
     "/usr/*" \
-    "*/.conan/*" \
+    "*/.conan2/*" \
     "*/nlohmann/*" \
     "*/build/*" \
     "*/tests/*" \

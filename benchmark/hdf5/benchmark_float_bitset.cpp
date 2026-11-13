@@ -14,20 +14,13 @@
 #include <vector>
 
 #include "benchmark_knowhere.h"
+#include "filemanager/FileManager.h"
+#include "filemanager/impl/LocalFileManager.h"
 #include "knowhere/comp/index_param.h"
 #include "knowhere/comp/knowhere_config.h"
-#include "knowhere/comp/local_file_manager.h"
 #include "knowhere/dataset.h"
 
 const int32_t GPU_DEVICE_ID = 0;
-
-namespace fs = std::filesystem;
-std::string kDir = fs::current_path().string() + "/diskann_test";
-std::string kRawDataPath = kDir + "/raw_data";
-std::string kL2IndexDir = kDir + "/l2_index";
-std::string kIPIndexDir = kDir + "/ip_index";
-std::string kL2IndexPrefix = kL2IndexDir + "/l2";
-std::string kIPIndexPrefix = kIPIndexDir + "/ip";
 
 constexpr uint32_t kNumRows = 10000;
 constexpr uint32_t kNumQueries = 100;
@@ -35,22 +28,16 @@ constexpr uint32_t kDim = 128;
 constexpr uint32_t kK = 10;
 constexpr float kL2KnnRecall = 0.8;
 
-void
-WriteRawDataToDisk(const std::string data_path, const float* raw_data, const uint32_t num, const uint32_t dim) {
-    std::ofstream writer(data_path.c_str(), std::ios::binary);
-    writer.write((char*)&num, sizeof(uint32_t));
-    writer.write((char*)&dim, sizeof(uint32_t));
-    writer.write((char*)raw_data, sizeof(float) * num * dim);
-    writer.close();
-}
-
 class Benchmark_float_bitset : public Benchmark_knowhere, public ::testing::Test {
  public:
+    template <typename T>
     void
     test_ivf(const knowhere::Json& cfg) {
         auto conf = cfg;
 
-        printf("\n[%0.3f s] %s | %s \n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str());
+        std::string data_type_str = get_data_type_name<T>();
+        printf("\n[%0.3f s] %s | %s(%s) \n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str(),
+               data_type_str.c_str());
         printf("================================================================================\n");
         for (auto per : PERCENTs_) {
             auto bitset_data = GenRandomBitset(nb_, nb_ * per / 100);
@@ -58,14 +45,15 @@ class Benchmark_float_bitset : public Benchmark_knowhere, public ::testing::Test
 
             for (auto nq : NQs_) {
                 auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
+                auto query = knowhere::ConvertToDataTypeIfNeeded<T>(ds_ptr);
                 for (auto k : TOPKs_) {
                     conf[knowhere::meta::TOPK] = k;
-                    auto g_result = golden_index_.value().Search(*ds_ptr, conf, bitset);
+                    auto g_result = golden_index_.value().Search(ds_ptr, conf, bitset);
                     auto g_ids = g_result.value()->GetIds();
-                    CALC_TIME_SPAN(auto result = index_.value().Search(*ds_ptr, conf, bitset));
+                    CALC_TIME_SPAN(auto result = index_.value().Search(query, conf, bitset));
                     auto ids = result.value()->GetIds();
                     float recall = CalcRecall(g_ids, ids, nq, k);
-                    printf("  bitset_per = %3d%%, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", per, nq, k, t_diff,
+                    printf("  bitset_per = %3d%%, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", per, nq, k, TDIFF_,
                            recall);
                     std::fflush(stdout);
                 }
@@ -75,11 +63,14 @@ class Benchmark_float_bitset : public Benchmark_knowhere, public ::testing::Test
         printf("[%.3f s] Test '%s/%s' done\n\n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str());
     }
 
+    template <typename T>
     void
     test_hnsw(const knowhere::Json& cfg) {
         auto conf = cfg;
 
-        printf("\n[%0.3f s] %s | %s \n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str());
+        std::string data_type_str = get_data_type_name<T>();
+        printf("\n[%0.3f s] %s | %s(%s) \n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str(),
+               data_type_str.c_str());
         printf("================================================================================\n");
         for (auto per : PERCENTs_) {
             auto bitset_data = GenRandomBitset(nb_, nb_ * per / 100);
@@ -87,14 +78,15 @@ class Benchmark_float_bitset : public Benchmark_knowhere, public ::testing::Test
 
             for (auto nq : NQs_) {
                 auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
+                auto query = knowhere::ConvertToDataTypeIfNeeded<T>(ds_ptr);
                 for (auto k : TOPKs_) {
                     conf[knowhere::meta::TOPK] = k;
-                    auto g_result = golden_index_.value().Search(*ds_ptr, conf, bitset);
+                    auto g_result = golden_index_.value().Search(ds_ptr, conf, bitset);
                     auto g_ids = g_result.value()->GetIds();
-                    CALC_TIME_SPAN(auto result = index_.value().Search(*ds_ptr, conf, bitset));
+                    CALC_TIME_SPAN(auto result = index_.value().Search(query, conf, bitset));
                     auto ids = result.value()->GetIds();
                     float recall = CalcRecall(g_ids, ids, nq, k);
-                    printf("  bitset_per = %3d%%, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", per, nq, k, t_diff,
+                    printf("  bitset_per = %3d%%, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", per, nq, k, TDIFF_,
                            recall);
                     std::fflush(stdout);
                 }
@@ -104,24 +96,30 @@ class Benchmark_float_bitset : public Benchmark_knowhere, public ::testing::Test
         printf("[%.3f s] Test '%s/%s' done\n\n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str());
     }
 
+#ifdef KNOWHERE_WITH_DISKANN
+    template <typename T>
     void
     test_diskann(const knowhere::Json& cfg) {
         auto conf = cfg;
-        conf["index_prefix"] = (metric_type_ == knowhere::metric::L2 ? kL2IndexPrefix : kIPIndexPrefix);
 
-        printf("\n[%0.3f s] %s | %s \n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str());
+        std::string data_type_str = get_data_type_name<T>();
+        printf("\n[%0.3f s] %s | %s(%s) \n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str(),
+               data_type_str.c_str());
         printf("================================================================================\n");
         for (auto per : PERCENTs_) {
             auto bitset_data = GenRandomBitset(nb_, nb_ * per / 100);
             knowhere::BitsetView bitset(bitset_data.data(), nb_);
             for (auto nq : NQs_) {
                 auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
+                auto query = knowhere::ConvertToDataTypeIfNeeded<T>(ds_ptr);
                 for (auto k : TOPKs_) {
                     conf[knowhere::meta::TOPK] = k;
-                    CALC_TIME_SPAN(auto result = index_.value().Search(*ds_ptr, conf, bitset));
+                    auto g_result = golden_index_.value().Search(ds_ptr, conf, bitset);
+                    auto g_ids = g_result.value()->GetIds();
+                    CALC_TIME_SPAN(auto result = index_.value().Search(query, conf, bitset));
                     auto ids = result.value()->GetIds();
-                    float recall = CalcRecall(ids, nq, k);
-                    printf("  bitset_per = %3d%%, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", per, nq, k, t_diff,
+                    float recall = CalcRecall(g_ids, ids, nq, k);
+                    printf("  bitset_per = %3d%%, nq = %4d, k = %4d, elapse = %6.3fs, R@ = %.4f\n", per, nq, k, TDIFF_,
                            recall);
                     std::fflush(stdout);
                 }
@@ -130,6 +128,7 @@ class Benchmark_float_bitset : public Benchmark_knowhere, public ::testing::Test
         printf("================================================================================\n");
         printf("[%.3f s] Test '%s/%s' done\n\n", get_time_diff(), ann_test_name_.c_str(), index_type_.c_str());
     }
+#endif
 
  protected:
     void
@@ -137,10 +136,12 @@ class Benchmark_float_bitset : public Benchmark_knowhere, public ::testing::Test
         T0_ = elapsed();
         set_ann_test_name("sift-128-euclidean");
         parse_ann_test_name();
-        load_hdf5_data<false>();
+        load_hdf5_data<knowhere::fp32>();
 
         cfg_[knowhere::meta::METRIC_TYPE] = metric_type_;
         knowhere::KnowhereConfig::SetSimdType(knowhere::KnowhereConfig::SimdType::AVX2);
+        knowhere::KnowhereConfig::SetBuildThreadPoolSize(default_build_thread_num);
+        knowhere::KnowhereConfig::SetSearchThreadPoolSize(default_search_thread_num);
         printf("faiss::distance_compute_blas_threshold: %ld\n", knowhere::KnowhereConfig::GetBlasThreshold());
 
         create_golden_index(cfg_);
@@ -170,59 +171,80 @@ class Benchmark_float_bitset : public Benchmark_knowhere, public ::testing::Test
     // const std::vector<int32_t> EFs_ = {128, 256, 512};
 };
 
+#define TEST_INDEX(NAME, T, X)              \
+    index_file_name = get_index_name<T>(X); \
+    create_index<T>(index_file_name, conf); \
+    test_##NAME<T>(conf)
+
 TEST_F(Benchmark_float_bitset, TEST_IVF_FLAT) {
-#ifdef KNOWHERE_WITH_RAFT
-    index_type_ = knowhere::IndexEnum::INDEX_RAFT_IVFFLAT;
+#ifdef KNOWHERE_WITH_CUVS
+    index_type_ = knowhere::IndexEnum::INDEX_CUVS_IVFFLAT;
 #else
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
 #endif
 
+    std::string index_file_name;
     knowhere::Json conf = cfg_;
-    std::string index_file_name = get_index_name({});
-    create_index(index_file_name, conf);
-    test_ivf(conf);
+    std::vector<int32_t> params = {};
+
+    TEST_INDEX(ivf, knowhere::fp32, params);
+    TEST_INDEX(ivf, knowhere::fp16, params);
+    TEST_INDEX(ivf, knowhere::bf16, params);
 }
 
 TEST_F(Benchmark_float_bitset, TEST_IVF_SQ8) {
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_IVFSQ8;
 
+    std::string index_file_name;
     knowhere::Json conf = cfg_;
-    std::string index_file_name = get_index_name({});
-    create_index(index_file_name, conf);
-    test_ivf(conf);
+    std::vector<int32_t> params = {};
+
+    TEST_INDEX(ivf, knowhere::fp32, params);
+    TEST_INDEX(ivf, knowhere::fp16, params);
+    TEST_INDEX(ivf, knowhere::bf16, params);
 }
 
 TEST_F(Benchmark_float_bitset, TEST_IVF_PQ) {
-#ifdef KNOWHERE_WITH_RAFT
-    index_type_ = knowhere::IndexEnum::INDEX_RAFT_IVFPQ;
+#ifdef KNOWHERE_WITH_CUVS
+    index_type_ = knowhere::IndexEnum::INDEX_CUVS_IVFPQ;
 #else
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_IVFPQ;
 #endif
 
+    std::string index_file_name;
     knowhere::Json conf = cfg_;
-    std::string index_file_name = get_index_name({});
-    create_index(index_file_name, conf);
-    test_ivf(conf);
+    std::vector<int32_t> params = {};
+
+    TEST_INDEX(ivf, knowhere::fp32, params);
+    TEST_INDEX(ivf, knowhere::fp16, params);
+    TEST_INDEX(ivf, knowhere::bf16, params);
 }
 
 TEST_F(Benchmark_float_bitset, TEST_HNSW) {
     index_type_ = knowhere::IndexEnum::INDEX_HNSW;
 
+    std::string index_file_name;
     knowhere::Json conf = cfg_;
-    std::string index_file_name = get_index_name({});
-    create_index(index_file_name, conf);
-    test_hnsw(conf);
+    std::vector<int32_t> params = {};
+
+    TEST_INDEX(hnsw, knowhere::fp32, params);
+    TEST_INDEX(hnsw, knowhere::fp16, params);
+    TEST_INDEX(hnsw, knowhere::bf16, params);
 }
 
+#ifdef KNOWHERE_WITH_DISKANN
 TEST_F(Benchmark_float_bitset, TEST_DISKANN) {
     index_type_ = knowhere::IndexEnum::INDEX_DISKANN;
 
     knowhere::Json conf = cfg_;
 
-    conf["index_prefix"] = (metric_type_ == knowhere::metric::L2 ? kL2IndexPrefix : kIPIndexPrefix);
-    conf["data_path"] = kRawDataPath;
-    conf["pq_code_budget_gb"] = sizeof(float) * kDim * kNumRows * 0.125 / (1024 * 1024 * 1024);
-    conf["build_dram_budget_gb"] = 32.0;
+    conf[knowhere::meta::INDEX_PREFIX] = (metric_type_ == knowhere::metric::L2 ? kL2IndexPrefix : kIPIndexPrefix);
+    conf[knowhere::meta::DATA_PATH] = kRawDataPath;
+    conf[knowhere::indexparam::MAX_DEGREE] = 56;
+    conf[knowhere::indexparam::PQ_CODE_BUDGET_GB] = sizeof(float) * kDim * kNumRows * 0.125 / (1024 * 1024 * 1024);
+    conf[knowhere::indexparam::BUILD_DRAM_BUDGET_GB] = 32.0;
+    conf[knowhere::indexparam::SEARCH_CACHE_BUDGET_GB] = 0;
+    conf[knowhere::indexparam::BEAMWIDTH] = 8;
 
     fs::create_directory(kDir);
     fs::create_directory(kL2IndexDir);
@@ -230,13 +252,19 @@ TEST_F(Benchmark_float_bitset, TEST_DISKANN) {
 
     WriteRawDataToDisk(kRawDataPath, (const float*)xb_, (const uint32_t)nb_, (const uint32_t)dim_);
 
-    std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
+    std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
     auto diskann_index_pack = knowhere::Pack(file_manager);
 
     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
     index_ = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(index_type_, version, diskann_index_pack);
     printf("[%.3f s] Building all on %d vectors\n", get_time_diff(), nb_);
     knowhere::DataSetPtr ds_ptr = nullptr;
-    index_.value().Build(*ds_ptr, conf);
-    test_diskann(conf);
+    index_.value().Build(ds_ptr, conf);
+
+    knowhere::BinarySet binset;
+    index_.value().Serialize(binset);
+    index_.value().Deserialize(binset, conf);
+
+    test_diskann<knowhere::fp32>(conf);
 }
+#endif

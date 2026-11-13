@@ -28,15 +28,15 @@ class Benchmark_binary_range : public Benchmark_knowhere, public ::testing::Test
                radius);
         printf("================================================================================\n");
         for (auto nq : NQs_) {
-            knowhere::DataSetPtr ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
-            CALC_TIME_SPAN(auto result = index_.value().RangeSearch(*ds_ptr, conf, nullptr));
+            auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
+            CALC_TIME_SPAN(auto result = index_.value().RangeSearch(ds_ptr, conf, nullptr));
             auto ids = result.value()->GetIds();
             auto distances = result.value()->GetDistance();
             auto lims = result.value()->GetLims();
             CheckDistance(metric_type_, ids, distances, lims, nq);
             float recall = CalcRecall(ids, lims, nq);
             float accuracy = CalcAccuracy(ids, lims, nq);
-            printf("  nq = %4d, elapse = %6.3fs, R@ = %.4f, A@ = %.4f\n", nq, t_diff, recall, accuracy);
+            printf("  nq = %4d, elapse = %6.3fs, R@ = %.4f, A@ = %.4f\n", nq, TDIFF_, recall, accuracy);
             std::fflush(stdout);
         }
         printf("================================================================================\n");
@@ -55,13 +55,13 @@ class Benchmark_binary_range : public Benchmark_knowhere, public ::testing::Test
         for (auto nprobe : NPROBEs_) {
             conf[knowhere::indexparam::NPROBE] = nprobe;
             for (auto nq : NQs_) {
-                knowhere::DataSetPtr ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
-                CALC_TIME_SPAN(auto result = index_.value().RangeSearch(*ds_ptr, conf, nullptr));
+                auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
+                CALC_TIME_SPAN(auto result = index_.value().RangeSearch(ds_ptr, conf, nullptr));
                 auto ids = result.value()->GetIds();
                 auto lims = result.value()->GetLims();
                 float recall = CalcRecall(ids, lims, nq);
                 float accuracy = CalcAccuracy(ids, lims, nq);
-                printf("  nprobe = %4d, nq = %4d, elapse = %6.3fs, R@ = %.4f, A@ = %.4f\n", nprobe, nq, t_diff, recall,
+                printf("  nprobe = %4d, nq = %4d, elapse = %6.3fs, R@ = %.4f, A@ = %.4f\n", nprobe, nq, TDIFF_, recall,
                        accuracy);
                 std::fflush(stdout);
             }
@@ -83,13 +83,13 @@ class Benchmark_binary_range : public Benchmark_knowhere, public ::testing::Test
         for (auto ef : EFs_) {
             conf[knowhere::indexparam::EF] = ef;
             for (auto nq : NQs_) {
-                knowhere::DataSetPtr ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
-                CALC_TIME_SPAN(auto result = index_.value().RangeSearch(*ds_ptr, conf, nullptr));
+                auto ds_ptr = knowhere::GenDataSet(nq, dim_, xq_);
+                CALC_TIME_SPAN(auto result = index_.value().RangeSearch(ds_ptr, conf, nullptr));
                 auto ids = result.value()->GetIds();
                 auto lims = result.value()->GetLims();
                 float recall = CalcRecall(ids, lims, nq);
                 float accuracy = CalcAccuracy(ids, lims, nq);
-                printf("  ef = %4d, nq = %4d, elapse = %6.3fs, R@ = %.4f, A@ = %.4f\n", ef, nq, t_diff, recall,
+                printf("  ef = %4d, nq = %4d, elapse = %6.3fs, R@ = %.4f, A@ = %.4f\n", ef, nq, TDIFF_, recall,
                        accuracy);
                 std::fflush(stdout);
             }
@@ -109,12 +109,14 @@ class Benchmark_binary_range : public Benchmark_knowhere, public ::testing::Test
 #else
         set_ann_test_name("sift-4096-hamming-range");
         parse_ann_test_name_with_range();
-        load_hdf5_data_range<true>();
+        load_hdf5_data_range<knowhere::bin1>();
 #endif
 
         cfg_[knowhere::meta::METRIC_TYPE] = metric_type_;
         cfg_[knowhere::meta::RADIUS] = *gt_radius_;
         knowhere::KnowhereConfig::SetSimdType(knowhere::KnowhereConfig::SimdType::AVX2);
+        knowhere::KnowhereConfig::SetBuildThreadPoolSize(default_build_thread_num);
+        knowhere::KnowhereConfig::SetSearchThreadPoolSize(default_search_thread_num);
         printf("faiss::distance_compute_blas_threshold: %ld\n", knowhere::KnowhereConfig::GetBlasThreshold());
     }
 
@@ -180,8 +182,9 @@ TEST_F(Benchmark_binary_range, TEST_BINARY_IDMAP) {
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_BIN_IDMAP;
 
     knowhere::Json conf = cfg_;
-    std::string index_file_name = get_index_name({});
-    create_index(index_file_name, conf);
+    std::vector<int32_t> params = {};
+    std::string index_file_name = get_index_name<knowhere::bin1>(params);
+    create_index<knowhere::bin1>(index_file_name, conf);
     test_binary_idmap(conf);
 }
 
@@ -191,8 +194,9 @@ TEST_F(Benchmark_binary_range, TEST_BINARY_IVF_FLAT) {
     knowhere::Json conf = cfg_;
     for (auto nlist : NLISTs_) {
         conf[knowhere::indexparam::NLIST] = nlist;
-        std::string index_file_name = get_index_name({nlist});
-        create_index(index_file_name, conf);
+        std::vector<int32_t> params = {nlist};
+        std::string index_file_name = get_index_name<knowhere::bin1>(params);
+        create_index<knowhere::bin1>(index_file_name, conf);
         test_binary_ivf(conf);
     }
 }
@@ -205,8 +209,9 @@ TEST_F(Benchmark_binary_range, TEST_BINARY_HNSW) {
         conf[knowhere::indexparam::HNSW_M] = M;
         for (auto efc : EFCONs_) {
             conf[knowhere::indexparam::EFCONSTRUCTION] = efc;
-            std::string index_file_name = get_index_name({M, efc});
-            create_index(index_file_name, conf);
+            std::vector<int32_t> params = {M, efc};
+            std::string index_file_name = get_index_name<knowhere::bin1>(params);
+            create_index<knowhere::bin1>(index_file_name, conf);
             test_binary_hnsw(conf);
         }
     }

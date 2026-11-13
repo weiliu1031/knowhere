@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <stdexcept>
 
-#include "common/lru_cache.h"
 #include "io/file_io.h"
 #include "knowhere/bitsetview.h"
 #include "knowhere/operands.h"
@@ -24,6 +23,50 @@
 #include <list>
 #include <random>
 #include <unordered_set>
+
+#ifdef KNOWHERE_WITH_CUVS
+#include <raft/core/detail/mdspan_numpy_serializer.hpp>
+#include <cuvs/distance/distance.hpp>
+#include "common/cuvs/integration/type_mappers.hpp"
+// Versions accepted by the CPU reader must match its implemented wire format.
+// Keep this independent of future changes to the cuVS writer.
+namespace cuvs_knowhere_detail {
+enum class CagraSerializationVersion : int {
+    DatasetFlag = 4,
+    ContentMap = 5,
+};
+// CAGRA v5 content_map is a uint32_t bitmask of optional payloads after the graph:
+// bit 0 marks the dataset; bit 1 marks source_indices (internal row to source ID mapping).
+inline constexpr uint32_t cagra_content_dataset = uint32_t{1} << 0;
+
+inline cuvs::distance::DistanceType
+deserialize_cagra_metric(std::istream& input) {
+    namespace serializer = raft::detail::numpy_serializer;
+    auto header = serializer::read_header(input);
+    if (!header.shape.empty()) {
+        throw std::runtime_error("CAGRA metric must be a scalar");
+    }
+    auto read_metric = [&input](auto value) {
+        input.read(reinterpret_cast<char*>(&value), sizeof(value));
+        if (!input.good()) {
+            throw std::runtime_error("Error reading CAGRA metric");
+        }
+        return static_cast<cuvs::distance::DistanceType>(value);
+    };
+    // RAFT used uint16_t; cuVS used a C enum (uint32_t), then an int32_t scoped enum.
+    if (header.dtype == serializer::get_numpy_dtype<uint16_t>()) {
+        return read_metric(uint16_t{});
+    }
+    if (header.dtype == serializer::get_numpy_dtype<uint32_t>()) {
+        return read_metric(uint32_t{});
+    }
+    if (header.dtype == serializer::get_numpy_dtype<int32_t>()) {
+        return read_metric(int32_t{});
+    }
+    throw std::runtime_error("Unsupported CAGRA metric dtype " + header.dtype.to_string());
+}
+}
+#endif
 
 #include "hnswlib.h"
 #include "io/memory_io.h"
@@ -65,12 +108,21 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                   std::is_same_v<data_t, knowhere::fp16> || std::is_same_v<data_t, knowhere::bf16>);
 
  public:
+    bool base_layer_only = {false};
+    int num_seeds = 32;
     static const tableint max_update_element_locks = 65536;
 
     static constexpr bool sq_enabled = quant_type != QuantType::None && knowhere::KnowhereFloatTypeCheck<data_t>::value;
     static constexpr bool has_raw_data = quant_type == QuantType::None || quant_type == QuantType::SQ8Refine;
 
-    HierarchicalNSW(SpaceInterface<dist_t>* s) {
+    HierarchicalNSW(SpaceInterface<dist_t>* s)
+        : space_(nullptr),
+          metric_type_(Metric::UNKNOWN),
+          cur_element_count(0),
+          visited_list_pool_(nullptr),
+          data_level0_memory_(nullptr),
+          data_norm_l2_(nullptr),
+          linkLists_(nullptr) {
     }
 
     HierarchicalNSW(SpaceInterface<dist_t>* s, const std::string& location, bool nmslib = false,
@@ -245,8 +297,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t map_size_;
 
     float alpha_ = 0.0f;
-
-    mutable knowhere::lru_cache<uint64_t, tableint> lru_cache;
 
     // Symmetric quantization to encode each element value from [-alpha, alpha] to [-127, 127]
     void
@@ -433,7 +483,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             metric_hops++;
             metric_distance_computations += size;
         }
-        float kAlpha = bitset.filter_ratio() / 2.0f;
+        float kAlpha = bitset.filter_ratio() * 0.7f;
         for (size_t i = 1; i <= size; ++i) {
             if (i + 1 <= size) {
                 prefetchData(list[i + 1]);
@@ -482,7 +532,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     searchBaseLayerST(tableint ep_id, const void* data_point, size_t ef, std::vector<bool>& visited,
                       const knowhere::BitsetView& bitset,
                       const knowhere::feder::hnsw::FederResultUniq& feder_result = nullptr,
-                      IteratorMinHeap* disqualified = nullptr, float accumulative_alpha = 0.0f) const {
+                      IteratorMinHeap* disqualified = nullptr, float accumulative_alpha = 1.0f) const {
         if (feder_result != nullptr) {
             feder_result->visit_info_.AddLevelVisitRecord(0);
         }
@@ -893,8 +943,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 input.read(linkLists_[i], linkListSize);
             }
         }
-
-        input.close();
     }
 
     void
@@ -1041,6 +1089,143 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
     }
+
+#ifdef KNOWHERE_WITH_CUVS
+    void
+    loadIndexFromGpuFormat(std::istream& input, size_t max_elements_i = 0) {
+        using idxt = cuvs_knowhere::cuvs_indexing_t<cuvs_proto::cuvs_index_kind::cagra>;
+        
+        char dtype_string[4]{};
+        input.read(dtype_string, 4);
+        if (std::string(dtype_string, 4) == "\x93NUM") {
+            // CAGRA v1/v2 start with a NumPy header, without the dtype prefix added in v3.
+            throw std::runtime_error("Unsupported legacy CAGRA serialization format without a dtype prefix");
+        }
+        using SerializationVersion = cuvs_knowhere_detail::CagraSerializationVersion;
+        auto file_version = raft::detail::numpy_serializer::deserialize_scalar<int>(input);
+        auto version = static_cast<SerializationVersion>(file_version);
+        switch (version) {
+            case SerializationVersion::DatasetFlag:
+            case SerializationVersion::ContentMap:
+                break;
+            default:
+                throw std::runtime_error("Unsupported CAGRA serialization version " + std::to_string(file_version));
+        }
+        
+        auto n_rows = raft::detail::numpy_serializer::deserialize_scalar<idxt>(input);
+        auto dim = raft::detail::numpy_serializer::deserialize_scalar<std::uint32_t>(input);
+        auto graph_degree = raft::detail::numpy_serializer::deserialize_scalar<std::uint32_t>(input);
+        auto metric = cuvs_knowhere_detail::deserialize_cagra_metric(input);
+
+        if (metric == cuvs::distance::DistanceType::L2Expanded) {
+            metric_type_ = Metric::L2;
+        } else if (metric == cuvs::distance::DistanceType::InnerProduct) {
+            metric_type_ = Metric::INNER_PRODUCT;
+        } else if (metric == cuvs::distance::DistanceType::CosineExpanded) {
+            metric_type_ = Metric::COSINE;
+        } else {
+            metric_type_ = Metric::UNKNOWN;
+        }
+
+        if constexpr (knowhere::KnowhereFloatTypeCheck<data_t>::value) {
+            if (metric_type_ == Metric::L2) {
+                space_ = new hnswlib::L2Space<data_t, dist_t>(dim);
+            } else if (metric_type_ == Metric::INNER_PRODUCT) {
+                space_ = new hnswlib::InnerProductSpace<data_t, dist_t>(dim);
+            } else if (metric_type_ == Metric::COSINE) {
+                space_ = new hnswlib::CosineSpace<data_t, dist_t>(dim);
+            } else {
+                throw std::runtime_error("Invalid metric type for float data type(float32, float16 and bfloat16):" +
+                                         std::to_string(metric_type_));
+            }
+        } else {
+            if (metric_type_ == Metric::HAMMING) {
+                space_ = new hnswlib::HammingSpace(dim);
+            } else if (metric_type_ == Metric::JACCARD) {
+                space_ = new hnswlib::JaccardSpace(dim);
+            } else {
+                throw std::runtime_error("Invalid metric type for binary data type :" + std::to_string(metric_type_));
+            }
+        }
+
+        data_size_ = dim * sizeof(float);
+        fstdistfunc_ = space_->get_dist_func();
+        dist_func_param_ = space_->get_dist_func_param();
+        offsetLevel0_ = 0;
+        max_elements_ = n_rows;
+        cur_element_count = n_rows;
+        size_t max_elements = max_elements_i;
+        if (max_elements < cur_element_count) {
+            max_elements = max_elements_;
+        }
+        max_elements_ = max_elements;
+
+        size_data_per_element_ = static_cast<std::size_t>(graph_degree * sizeof(idxt) + 4 + (n_rows > 0 ? dim * sizeof(data_t) : 0) + 8);
+        label_offset_ = size_data_per_element_ - 8;
+        offsetData_ = graph_degree * sizeof(idxt) + 4;
+        maxlevel_ = 1;
+        enterpoint_node_ = n_rows / 2;
+        maxM_ = graph_degree / 2;
+        maxM0_ = graph_degree;
+        M_ = graph_degree / 2;
+        mult_ = 0.42424242;
+        ef_construction_ = 500;
+        
+        data_level0_memory_ = (char*)malloc(max_elements * size_data_per_element_);  // NOLINT
+        if (data_level0_memory_ == nullptr)
+            throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
+        
+        [[maybe_unused]] auto header = raft::detail::numpy_serializer::read_header(input);
+        for (size_t i = 0; i < max_elements; i++) {
+            auto offset = i * size_data_per_element_;
+            memcpy(data_level0_memory_ + offset, &graph_degree, sizeof(int));
+            offset += sizeof(int);
+            input.read(data_level0_memory_ + offset, graph_degree * sizeof(idxt));
+        }
+        bool include_dataset;
+        if (version == SerializationVersion::DatasetFlag) {
+            include_dataset = raft::detail::numpy_serializer::deserialize_scalar<bool>(input);
+        } else {
+            auto content_map = raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input);
+            include_dataset = (content_map & cuvs_knowhere_detail::cagra_content_dataset) != 0;
+        }
+        if (include_dataset) {
+            constexpr uint32_t kSerializeEmptyDataset   = 1;
+            if (kSerializeEmptyDataset == raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input)) {
+                [[maybe_unused]] auto suggested_dim = raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input);
+            } else {
+                [[maybe_unused]] auto data_type = raft::detail::numpy_serializer::deserialize_scalar<cudaDataType_t>(input);
+                [[maybe_unused]] auto n_rows = raft::detail::numpy_serializer::deserialize_scalar<int64_t>(input);
+                auto dim = raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input);
+                [[maybe_unused]] auto stride = raft::detail::numpy_serializer::deserialize_scalar<uint32_t>(input);
+                [[maybe_unused]] auto header = raft::detail::numpy_serializer::read_header(input);
+                for (size_t i = 0; i < max_elements; i++) {
+                    auto offset = i * size_data_per_element_ + sizeof(int) + graph_degree * sizeof(idxt);
+                    input.read(data_level0_memory_ + offset, dim * sizeof(data_t));
+                }
+            }
+        }
+        for (size_t i = 0; i < max_elements; i++) {
+            auto offset = i * size_data_per_element_ + sizeof(int) + graph_degree * sizeof(idxt) + (n_rows > 0 ? dim * sizeof(data_t) : 0);
+            memcpy(data_level0_memory_ + offset, &i, sizeof(size_t));
+        }
+
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+
+        visited_list_pool_ = new VisitedListPool(max_elements);
+
+        linkLists_ = (char**)malloc(sizeof(void*) * max_elements);
+        if (linkLists_ == nullptr)
+            throw std::runtime_error("Not enough memory: loadIndex failed to allocate linklists");
+        element_levels_ = std::vector<int>(max_elements);
+        revSize_ = 1.0 / mult_;
+        ef_ = 10;
+
+        input.sync();
+    }
+#endif
 
     unsigned short int
     getListCount(linklistsizeint* ptr) const {
@@ -1234,7 +1419,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if constexpr (has_raw_data) {
             memcpy(getDataByInternalId(cur_c), data_point, data_size_);
             if (metric_type_ == Metric::COSINE) {
-                data_norm_l2_[cur_c] = std::sqrt(NormSqr<data_t, dist_t>(data_point, dist_func_param_));
+                float norm = NormSqr<data_t, dist_t>(data_point, dist_func_param_);
+                data_norm_l2_[cur_c] = (norm == 0.0 ? 1.0 : std::sqrt(norm));
             }
         }
         if constexpr (sq_enabled) {
@@ -1331,10 +1517,19 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         } else {
             vec_hash = knowhere::hash_vec((const float*)query_data, *(size_t*)dist_func_param_);
         }
-        // for tuning, do not use cache
-        if ((param && param->for_tuning) || !lru_cache.try_get(vec_hash, currObj)) {
-            dist_t curdist = calcDistance(query_data, enterpoint_node_);
 
+        dist_t curdist = calcDistance(query_data, enterpoint_node_);
+
+        if (base_layer_only) {
+            for (int i = 0; i < num_seeds; i++) {
+                tableint obj = i * (max_elements_ / num_seeds);
+                dist_t dist = fstdistfunc_(query_data, getDataByInternalId(obj), dist_func_param_);
+                if (dist < curdist) {
+                    curdist = dist;
+                    currObj = obj;
+                }
+            }
+        } else {
             for (int level = maxlevel_; level > 0; level--) {
                 bool changed = true;
                 if (feder_result != nullptr) {
@@ -1372,6 +1567,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
         }
+
         return {currObj, vec_hash};
     }
 
@@ -1392,7 +1588,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         std::unique_ptr<int8_t[]> query_data_sq;
-        const data_t* raw_data = (const data_t*)query_data;
+        [[maybe_unused]] const data_t* raw_data = (const data_t*)query_data;
         if constexpr (sq_enabled) {
             query_data_sq = std::make_unique<int8_t[]>(*(size_t*)dist_func_param_);
             encodeSQuant((const data_t*)query_data, query_data_sq.get());
@@ -1427,6 +1623,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             retset =
                 searchBaseLayerST<false, true>(currObj, query_data, std::max(ef, k), visited, bitset, feder_result);
         }
+        // switch to brute-force when insufficient k
+        if (retset.size() < k) {
+            return searchKnnBF(query_data, k, bitset);
+        }
         std::vector<std::pair<dist_t, labeltype>> result;
         size_t len = std::min(k, retset.size());
         result.reserve(len);
@@ -1444,18 +1644,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 result.emplace_back(retset[i].distance, (labeltype)retset[i].id);
             }
         }
-        if (len > 0) {
-            lru_cache.put(vec_hash, result[0].second);
-        }
         return result;
     };
 
     std::unique_ptr<IteratorWorkspace>
-    getIteratorWorkspace(const void* query_data, const size_t seed_ef, const bool for_tuning,
-                         const knowhere::BitsetView& bitset) const {
+    getIteratorWorkspace(const void* query_data, const size_t ef, const knowhere::BitsetView& bitset) const {
         auto accumulative_alpha = (bitset.count() >= (cur_element_count * kHnswSearchKnnBFFilterThreshold))
                                       ? std::numeric_limits<float>::max()
-                                      : 0.0f;
+                                      : 1.0f;
         std::unique_ptr<int8_t[]> query_data_copy = nullptr;
         query_data_copy = std::make_unique<int8_t[]>(data_size_);
         std::memcpy(query_data_copy.get(), query_data, data_size_);
@@ -1471,7 +1667,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             encodeSQuant((data_t*)query_data_copy.get(), query_data_sq.get());
         }
 
-        return std::make_unique<IteratorWorkspace>(std::move(query_data_sq), max_elements_, seed_ef, for_tuning,
+        return std::make_unique<IteratorWorkspace>(std::move(query_data_sq), max_elements_, ef,
                                                    std::move(query_data_copy), bitset, accumulative_alpha);
     }
 
@@ -1489,11 +1685,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             tableint currObj = searchTopLayers(query_data, workspace->param.get()).first;
             NeighborSetDoublePopList retset;
             if (has_deletions) {
-                retset = searchBaseLayerST<true, true>(currObj, query_data, workspace->seed_ef, workspace->visited,
+                retset = searchBaseLayerST<true, true>(currObj, query_data, workspace->ef, workspace->visited,
                                                        workspace->bitset, feder_result, &workspace->to_visit,
                                                        workspace->accumulative_alpha);
             } else {
-                retset = searchBaseLayerST<false, true>(currObj, query_data, workspace->seed_ef, workspace->visited,
+                retset = searchBaseLayerST<false, true>(currObj, query_data, workspace->ef, workspace->visited,
                                                         workspace->bitset, feder_result, &workspace->to_visit,
                                                         workspace->accumulative_alpha);
             }
@@ -1599,8 +1795,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         if (retset.size() == 0) {
             return {};
-        } else {
-            lru_cache.put(vec_hash, retset[0].id);
         }
 
         return getNeighboursWithinRadius(retset, query_data, radius, bitset);

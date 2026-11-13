@@ -1,5 +1,5 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -24,9 +24,10 @@ struct IcmEncoderShards {
             workers;
 
     void add(IcmEncoderImpl* encoder) {
-        workers.emplace_back(std::make_pair(
-                std::unique_ptr<IcmEncoderImpl>(encoder),
-                std::unique_ptr<WorkerThread>(new WorkerThread)));
+        workers.emplace_back(
+                std::make_pair(
+                        std::unique_ptr<IcmEncoderImpl>(encoder),
+                        std::unique_ptr<WorkerThread>(new WorkerThread)));
     }
 
     IcmEncoderImpl* at(int idx) {
@@ -69,7 +70,7 @@ GpuIcmEncoder::GpuIcmEncoder(
 GpuIcmEncoder::~GpuIcmEncoder() {}
 
 void GpuIcmEncoder::set_binary_term() {
-    auto fn = [=](int idx, IcmEncoderImpl* encoder) {
+    auto fn = [lsq = lsq](int idx, IcmEncoderImpl* encoder) {
         encoder->setBinaryTerm(lsq->codebooks.data());
     };
     shards->runOnShards(fn);
@@ -82,7 +83,7 @@ void GpuIcmEncoder::encode(
         size_t n,
         size_t ils_iters) const {
     size_t nshards = shards->size();
-    size_t shard_size = (n + nshards - 1) / nshards;
+    size_t base_shard_size = n / nshards;
 
     auto codebooks = lsq->codebooks.data();
     auto M = lsq->M;
@@ -94,8 +95,14 @@ void GpuIcmEncoder::encode(
 
     // split input data
     auto fn = [=](int idx, IcmEncoderImpl* encoder) {
-        size_t i0 = idx * shard_size;
-        size_t ni = std::min(shard_size, n - i0);
+        size_t i0 = idx * base_shard_size + std::min(size_t(idx), n % nshards);
+        size_t ni = base_shard_size;
+        if (idx < n % nshards) {
+            ++ni;
+        }
+        if (ni <= 0) { // only if n < nshards
+            return;
+        }
         auto xi = x + i0 * d;
         auto ci = codes + i0 * M;
         std::mt19937 geni(idx + seed); // different seed for each shard

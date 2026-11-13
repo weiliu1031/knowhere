@@ -16,10 +16,19 @@
 #include <sstream>
 #include <utility>
 
+#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
+#include "common/OpContext.h"
+#include "common/Tracer.h"
+#include "knowhere/config.h"
+#endif
 #include "knowhere/log.h"
-#include "opentelemetry/exporters/jaeger/jaeger_exporter_factory.h"
 #include "opentelemetry/exporters/ostream/span_exporter_factory.h"
+#include "opentelemetry/exporters/otlp/otlp_http_exporter_factory.h"
+#include "opentelemetry/exporters/otlp/otlp_http_exporter_options.h"
+#ifdef HAVE_OTLP_GRPC_EXPORTER
 #include "opentelemetry/exporters/otlp/otlp_grpc_exporter_factory.h"
+#include "opentelemetry/exporters/otlp/otlp_grpc_exporter_options.h"
+#endif
 #include "opentelemetry/sdk/resource/resource.h"
 #include "opentelemetry/sdk/trace/batch_span_processor_factory.h"
 #include "opentelemetry/sdk/trace/sampler.h"
@@ -28,7 +37,6 @@
 #include "opentelemetry/sdk/trace/tracer_provider_factory.h"
 #include "opentelemetry/sdk/version/version.h"
 #include "opentelemetry/trace/span_context.h"
-#include "opentelemetry/trace/span_metadata.h"
 
 namespace knowhere::tracer {
 
@@ -37,7 +45,6 @@ namespace nostd = opentelemetry::nostd;
 
 namespace trace_sdk = opentelemetry::sdk::trace;
 namespace resource = opentelemetry::sdk::resource;
-namespace jaeger = opentelemetry::exporter::jaeger;
 namespace ostream = opentelemetry::exporter::trace;
 namespace otlp = opentelemetry::exporter::otlp;
 
@@ -47,21 +54,48 @@ static std::shared_ptr<trace::TracerProvider> noop_trace_provider =
 
 void
 initTelemetry(const TraceConfig& cfg) {
+    enable_trace = true;
     std::unique_ptr<opentelemetry::sdk::trace::SpanExporter> exporter;
     if (cfg.exporter == "stdout") {
         exporter = ostream::OStreamSpanExporterFactory::Create();
-    } else if (cfg.exporter == "jaeger") {
-        auto opts = jaeger::JaegerExporterOptions{};
-        opts.transport_format = jaeger::TransportFormat::kThriftHttp;
-        opts.endpoint = cfg.jaegerURL;
-        exporter = jaeger::JaegerExporterFactory::Create(opts);
-        LOG_KNOWHERE_INFO_ << "init jaeger exporter, endpoint: " << opts.endpoint;
     } else if (cfg.exporter == "otlp") {
-        auto opts = otlp::OtlpGrpcExporterOptions{};
-        opts.endpoint = cfg.otlpEndpoint;
-        opts.use_ssl_credentials = cfg.oltpSecure;
-        exporter = otlp::OtlpGrpcExporterFactory::Create(opts);
-        LOG_KNOWHERE_INFO_ << "init otlp exporter, endpoint: " << opts.endpoint;
+        if (cfg.otlpMethod == "http") {
+            auto opts = otlp::OtlpHttpExporterOptions{};
+            opts.url = cfg.otlpEndpoint;
+            exporter = otlp::OtlpHttpExporterFactory::Create(opts);
+            LOG_KNOWHERE_INFO_ << "init otlp http exporter, endpoint: " << opts.url;
+        }
+#ifdef HAVE_OTLP_GRPC_EXPORTER
+        else if (cfg.otlpMethod == "grpc" || cfg.otlpMethod == "") {
+            auto opts = otlp::OtlpGrpcExporterOptions{};
+            opts.endpoint = cfg.otlpEndpoint;
+            opts.use_ssl_credentials = cfg.otlpSecure;
+            exporter = otlp::OtlpGrpcExporterFactory::Create(opts);
+            LOG_KNOWHERE_INFO_ << "init otlp grpc exporter, endpoint: " << opts.endpoint;
+        }
+#else
+        else if (cfg.otlpMethod == "grpc" || cfg.otlpMethod == "") {
+            auto opts = otlp::OtlpHttpExporterOptions{};
+            // Convert gRPC endpoint (host:port) to HTTP URL for fallback
+            auto endpoint = cfg.otlpEndpoint;
+            if (endpoint.find("://") == std::string::npos) {
+                // Replace gRPC default port 4317 with HTTP default port 4318
+                auto pos = endpoint.rfind(":4317");
+                if (pos != std::string::npos && pos + 5 == endpoint.size()) {
+                    endpoint = endpoint.substr(0, pos) + ":4318";
+                }
+                endpoint = "http://" + endpoint + "/v1/traces";
+            }
+            opts.url = endpoint;
+            exporter = otlp::OtlpHttpExporterFactory::Create(opts);
+            LOG_KNOWHERE_INFO_ << "gRPC exporter unavailable, falling back to otlp http exporter, endpoint: "
+                               << opts.url;
+        }
+#endif
+        else {
+            LOG_KNOWHERE_INFO_ << "unknown otlp method: " << cfg.otlpMethod;
+            enable_trace = false;
+        }
     } else {
         LOG_KNOWHERE_INFO_ << "Empty Trace";
         enable_trace = false;
@@ -92,12 +126,38 @@ StartSpan(const std::string& name, TraceContext* ctx) {
         if (EmptyTraceID(ctx) || EmptySpanID(ctx)) {
             return noop_trace_provider->GetTracer("noop")->StartSpan("noop");
         }
+
         opts.parent = trace::SpanContext(trace::TraceId({ctx->traceID, trace::TraceId::kSize}),
                                          trace::SpanId({ctx->spanID, trace::SpanId::kSize}),
                                          trace::TraceFlags(ctx->traceFlags), true);
     }
     return GetTracer()->StartSpan(name, opts);
 }
+
+#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
+std::unique_ptr<milvus::tracer::AutoSpan>
+StartMilvusSpanFromOpContextOrConfig(const std::string& name, milvus::OpContext* op_context, const BaseConfig& cfg) {
+    if (!milvus::tracer::IsTraceEnabled()) {
+        return nullptr;
+    }
+
+    auto parent = milvus::OpContext::GetTraceSpan(op_context);
+    if (parent != nullptr) {
+        return std::make_unique<milvus::tracer::AutoSpan>(name, parent);
+    }
+
+    if (!cfg.trace_id.has_value() || !cfg.span_id.has_value()) {
+        return nullptr;
+    }
+
+    auto trace_id_str = milvus::tracer::GetIDFromHexStr(cfg.trace_id.value());
+    auto span_id_str = milvus::tracer::GetIDFromHexStr(cfg.span_id.value());
+    auto ctx = milvus::tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
+                                            .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
+                                            .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
+    return std::make_unique<milvus::tracer::AutoSpan>(name, &ctx);
+}
+#endif
 
 thread_local std::shared_ptr<trace::Span> local_span;
 void
@@ -143,12 +203,24 @@ EmptySpanID(const TraceContext* ctx) {
     return isEmptyID(ctx->spanID, trace::SpanId::kSize);
 }
 
-tracer::TraceContext
-GetTraceCtxFromCfg(const BaseConfig* cfg) {
-    auto trace_id = cfg->trace_id.value();
-    auto span_id = cfg->span_id.value();
-    auto trace_flags = cfg->trace_flags.value();
-    return tracer::TraceContext{trace_id.data(), span_id.data(), (uint8_t)trace_flags};
+std::string
+BytesToHexStr(const uint8_t* data, size_t len) {
+    std::stringstream ss;
+    for (size_t i = 0; i < len; i++) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[i]);
+    }
+    return ss.str();
+}
+
+std::string
+GetIDFromHexStr(const std::string& hexStr) {
+    std::stringstream ss;
+    for (size_t i = 0; i < (hexStr.length() / 2) * 2; i += 2) {
+        std::string byteStr = hexStr.substr(i, 2);
+        char byte = static_cast<char>(std::stoi(byteStr, nullptr, 16));
+        ss << byte;
+    }
+    return ss.str();
 }
 
 }  // namespace knowhere::tracer

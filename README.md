@@ -18,8 +18,9 @@ All Linux distributions are available for Knowhere development. However, a major
 
 Here's a list of verified OS types where Knowhere can successfully build and run:
 
-- Ubuntu 20.04 x86_64
-- Ubuntu 20.04 Aarch64
+- Ubuntu 22.04 x86_64
+- Ubuntu 22.04 Aarch64
+- Ubuntu 20.04 x86_64 / Aarch64 (EOL by April 2025 and kept for legacy reasons; see `scripts/install_deps.sh` for details)
 - MacOS (x86_64)
 - MacOS (Apple Silicon)
 
@@ -27,105 +28,112 @@ Here's a list of verified OS types where Knowhere can successfully build and run
 
 #### Install Dependencies
 
+`scripts/install_deps.sh` install all dependencies for building, testing, and shipping the knowhere library. If you don't need the full pipeline, please refer to the file and modify it for a more fine-grained dependency control.
+
 ```bash
-$ sudo apt install build-essential libopenblas-dev libaio-dev python3-dev python3-pip
-$ pip3 install conan==1.61.0 --user
-$ export PATH=$PATH:$HOME/.local/bin
+$ bash scripts/install_deps.sh
 ```
 
 #### Build From Source Code
 
-* Ubuntu 20.04
+A top-level `Makefile` provides a unified build interface. Run `make help` to see all targets and flags.
+
+GPU support is disabled by default, including with `WITH_CARDINAL=True`.
+Set `WITH_GPU=True` to enable Cardinal GPU support with Cardinal, or cuVS otherwise.
+`WITH_CUVS=True` explicitly enables cuVS, including alongside Cardinal, independently of `WITH_GPU`.
+
+GPU builds use CUDA 13.2 for both cuVS and Cardinal. CMake prepares the toolkit before enabling CUDA,
+including when Knowhere is built through `add_subdirectory`. An existing toolkit at `/usr/local/cuda-13.2`
+is reused; otherwise, `scripts/install_cuda.sh` installs it on Ubuntu 22.04/24.04 (x86_64 or aarch64),
+requiring root or passwordless sudo. Other systems must prepare the toolkit at that path beforehand.
+No GPU device or driver is needed to compile. Reconfigure the build when switching CUDA versions.
+CPU builds do not invoke the CUDA installer.
 
 ```bash
-$ mkdir build && cd build
-#add conan remote
-$ conan remote add default-conan-local https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local
-#DEBUG CPU
-$ conan install .. --build=missing -o with_ut=True -s compiler.libcxx=libstdc++11 -s build_type=Debug
-#RELEASE CPU
-$ conan install .. --build=missing -o with_ut=True -s compiler.libcxx=libstdc++11 -s build_type=Release
-#DEBUG GPU
-$ conan install .. --build=missing -o with_ut=True -o with_raft=True -s compiler.libcxx=libstdc++11 -s build_type=Debug
-#RELEASE GPU
-$ conan install .. --build=missing -o with_ut=True -o with_raft=True -s compiler.libcxx=libstdc++11 -s build_type=Release
-#DISKANN SUPPORT
-$ conan install .. --build=missing -o with_ut=True -o with_diskann=True -s compiler.libcxx=libstdc++11 -s build_type=Debug/Release
-#build with conan
-$ conan build ..
-#verbose
-export VERBOSE=1
-```
+# CPU release (default)
+$ make
 
-* MacOS
+# GPU release (cuVS)
+$ make WITH_GPU=True
 
-```bash
-#RELEASE CPU
-conan install .. --build=missing -o with_ut=True -s compiler.libcxx=libc++ -s build_type=Release
-#DEBUG CPU
-conan install .. --build=missing -o with_ut=True -s compiler.libcxx=libc++ -s build_type=Debug
+# GPU release (Cardinal)
+$ make WITH_CARDINAL=True WITH_GPU=True
+
+# CPU with unit tests
+$ make WITH_UT=True
+
+# CPU UT + AddressSanitizer
+$ make WITH_UT=True WITH_ASAN=True
+
+# GPU with unit tests
+$ make WITH_GPU=True WITH_UT=True
+
+# Debug build
+$ make WITH_DEBUG=True
+
+# C ABI and Java JNI bindings with the C tests (see java/README.md)
+$ make WITH_JNI=True WITH_C_API_TESTS=True
+
+# Custom compiler via Conan profile (e.g. clang, gcc-15)
+$ make CONAN_PROFILE=clang14
 ```
 
 #### Running Unit Tests
 
 ```bash
-# in build directories
-#Debug
-$ ./Debug/tests/ut/knowhere_tests
-#Release
-$ ./Release/tests/ut/knowhere_tests
+# requires a prior build with WITH_UT=True
+$ make test
 ```
 
 #### Clean up
 
 ```bash
-$ git clean -fxd
+$ make clean
 ```
 
-## GEN PYTHON WHEEL(NEED REALSE BUILD)
+## Python Wheel
 
-install dependency:
+Building the Python wheel requires `swig` and Python development headers (`python3-dev` on Ubuntu). These are installed automatically by `scripts/install_deps.sh`.
 
-```
-sudo apt install swig python3-dev
-pip3 install bfloat16
-```
-
-after build knowhere:
+After building Knowhere with a Release configuration:
 
 ```bash
-cd python
-python3 setup.py bdist_wheel
+# Build portable manylinux wheel
+$ make wheel
+
+# Install
+$ pip3 install python/dist/pyknowhere-*-manylinux*.whl
 ```
 
-install knowhere wheel:
+For more options (clean build, verbose, custom Python binary), see `python/build_portable_wheel.sh -h`.
 
-```bash
-pip3 install dist/pyknowhere-0.0.0-cp38-cp38-linux_x86_64.whl
-```
+## C and Java Bindings
 
-clean
-
-```bash
-cd python
-rm -rf build
-rm -rf dist
-rm -rf knowhere.egg-info
-rm knowhere/knowhere_wrap.cpp
-rm knowhere/swigknowhere.py
-```
+Optional C ABI and Java 11 JNI bindings expose indexes, brute-force search and
+named index blobs without a framework dependency. See [java/README.md](java/README.md)
+for build options, platform JAR packaging, ownership rules and tests.
 
 ## Contributing
 
 ### Pre-Commit
 
-Before submitting a pull request, please make sure running pre-commit checks locally to ensure the code is ready for review. Use the following command to install pre-commit checks:
+Before submitting a pull request, run pre-commit checks locally:
 
 ```bash
 pip3 install pre-commit
 pre-commit install --hook-type pre-commit --hook-type pre-push
 
-# If clang-format and clang-tidy not already installed:
+# Run all pre-commit hooks
+$ make pre-commit
+
+# Or run individually:
+$ make format   # clang-format
+$ make lint     # clang-tidy (requires a prior build)
+```
+
+If clang-format and clang-tidy are not already installed:
+
+```bash
 # linux
 apt install clang-format clang-tidy
 # mac

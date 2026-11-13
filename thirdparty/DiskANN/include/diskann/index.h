@@ -5,24 +5,25 @@
 
 #include <atomic>
 #include <cassert>
+#include <functional>
 #include <map>
 #include <shared_mutex>
 #include <sstream>
 #include <stack>
 #include <string>
-#include <unordered_map>
-#include <functional>
-#include "tsl/robin_set.h"
 #include "tsl/robin_map.h"
+#include "tsl/robin_set.h"
+#include <unordered_map>
 
+#include "concurrent_queue.h"
+#include "defaults.h"
 #include "distance.h"
 #include "neighbor.h"
 #include "parameters.h"
 #include "utils.h"
 #include "concurrent_queue.h"
-#include "knowhere/comp/thread_pool.h"
+#include "knowhere/thread_pool.h"
 
-#define GRAPH_SLACK_FACTOR 1.3
 #define OVERHEAD_FACTOR 1.1
 
 namespace boost {
@@ -35,15 +36,18 @@ namespace boost {
 
 namespace diskann {
   inline double estimate_ram_usage(_u64 size, _u32 dim, _u32 datasize,
-                                   _u32 degree) {
+                                   _u32 degree, bool is_gpu=false, double max_fraction=0.06) {
     double size_of_data = ((double) size) * ROUND_UP(dim, 8) * datasize;
     double size_of_graph =
-        ((double) size) * degree * sizeof(unsigned) * GRAPH_SLACK_FACTOR;
+        ((double) size) * degree * sizeof(unsigned) * diskann::defaults::GRAPH_SLACK_FACTOR;
     double size_of_locks = ((double) size) * sizeof(std::mutex);
     double size_of_outer_vector = ((double) size) * sizeof(ptrdiff_t);
-
-    return OVERHEAD_FACTOR * (size_of_data + size_of_graph + size_of_locks +
-                              size_of_outer_vector);
+    if(is_gpu) {
+    	size_of_outer_vector += size*max_fraction*(degree+2)*sizeof(unsigned);
+    }
+    double total_size =  OVERHEAD_FACTOR * (size_of_data + size_of_graph + size_of_locks +
+            size_of_outer_vector);
+    return total_size;
   }
 
   template<typename T>
@@ -352,7 +356,7 @@ namespace diskann {
     bool       _has_built = false;
     DISTFUN<T> _func = nullptr;
     DISTFUN<T> _distance;
-    unsigned                                       _width = 0;
+    std::atomic<unsigned>                          _width{0};
     unsigned                                       _ep = 0;
     size_t _max_range_of_loaded_graph = 0;
     bool   _saturate_graph = false;

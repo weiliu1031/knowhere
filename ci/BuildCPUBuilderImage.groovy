@@ -10,14 +10,15 @@ pipeline {
             //     command 'sleep'
             //     args 'infinity'
             // }
+            cloud 'new_ci_idc'
             inheritFrom 'default'
             yaml '''
 apiVersion: v1
 kind: Pod
 metadata:
   labels:
-    app: milvus-build
-  namespace: jenkins
+    app: knowhere-build
+  namespace: knowhere-ci
 spec:
   nodeSelector:
     app: knowhere
@@ -25,16 +26,6 @@ spec:
     - key: node-role.kubernetes.io/knowhere
       operator: Equal
       effect: NoSchedule
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector:
-            matchExpressions:
-            - key: app
-              operator: In
-              values:
-              - knowhere-e2e
-          topologyKey: "kubernetes.io/hostname"
   enableServiceLinks: false
   containers:
   - name: main

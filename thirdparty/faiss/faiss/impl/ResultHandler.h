@@ -1,5 +1,5 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -12,33 +12,69 @@
 #pragma once
 
 #include <faiss/impl/AuxIndexStructures.h>
+#include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/FaissException.h>
 #include <faiss/impl/IDSelector.h>
+#include <faiss/impl/InvertedListScannerStats.h>
 #include <faiss/utils/Heap.h>
 #include <faiss/utils/partitioning.h>
+#include <faiss/utils/simd_levels.h>
+#include <algorithm>
 #include <iostream>
 
-#include "knowhere/object.h"
-
 namespace faiss {
+
+/* result handlers for a single query */
+
+template <typename T, typename TI>
+struct ResultHandlerUnordered {
+    // if not better than threshold, then not necessary to call add_result
+    T threshold{};
+
+    // per-list scan statistics populated by inverted-list scanners
+    InvertedListScannerStats stats;
+
+    // return whether threshold was updated
+    virtual bool add_result(T dis, TI idx) = 0;
+
+    virtual ~ResultHandlerUnordered() {}
+};
+
+// handler for a single query
+template <class C>
+struct ResultHandlerT : ResultHandlerUnordered<typename C::T, typename C::TI> {
+    ResultHandlerT() {
+        this->threshold = C::neutral();
+    }
+
+    virtual ~ResultHandlerT() {}
+};
+
+// generic handler for searching in float indexes
+using ResultHandler = ResultHandlerUnordered<float, idx_t>;
 
 /*****************************************************************
  * The classes below are intended to be used as template arguments
  * they handle results for batches of queries (size nq).
  * They can be called in two ways:
- * - by instanciating a SingleResultHandler that tracks results for a single
+ * - by instantiating a SingleResultHandler that tracks results for a single
  *   query
  * - with begin_multiple/add_results/end_multiple calls where a whole block of
- *   resutls is submitted
- * All classes are templated on C which to define wheter the min or the max of
- * results is to be kept.
+ *   results is submitted
+ * All classes are templated on C which to define whether the min or the max of
+ * results is to be kept, and on sel, so that the codepaths for with / without
+ * selector can be separated at compile time.
  *****************************************************************/
 
-template <class C>
+template <class C, bool use_sel = false>
 struct BlockResultHandler {
     size_t nq; // number of queries for which we search
+    const IDSelector* sel;
 
-    explicit BlockResultHandler(size_t nq) : nq(nq) {}
+    explicit BlockResultHandler(size_t nq_, const IDSelector* sel_ = nullptr)
+            : nq(nq_), sel(sel_) {
+        assert(!use_sel || sel);
+    }
 
     // currently handled query range
     size_t i0 = 0, i1 = 0;
@@ -49,26 +85,90 @@ struct BlockResultHandler {
         this->i1 = i1_2;
     }
 
-    // todo: NULLPTR
     // add results for queries [i0, i1) and database [j0, j1)
-    virtual void add_results(size_t, size_t, const typename C::T*, const IDSelector* sel) {}
+    virtual void add_results(size_t, size_t, const typename C::T*) {}
 
     // series of results for queries i0..i1 is done
     virtual void end_multiple() {}
 
     virtual ~BlockResultHandler() {}
+
+    bool is_in_selection(idx_t i) const {
+        return !use_sel || sel->is_member(i);
+    }
 };
 
-// handler for a single query
-template <class C>
-struct ResultHandler {
-    // if not better than threshold, then not necessary to call add_result
-    typename C::T threshold = 0;
+/*****************************************************************
+ * Convenience classes for float Indexes
+ *****************************************************************/
 
-    // return whether threshold was updated
-    virtual bool add_result(typename C::T dis, typename C::TI idx) = 0;
+// fake BlockResultHandler for a single query
+template <class C, bool use_sel>
+struct SingleQueryBlockResultHandler : BlockResultHandler<C, use_sel> {
+    using T = typename C::T;
+    using TI = typename C::TI;
+    using BlockResultHandler<C, use_sel>::i0;
+    using BlockResultHandler<C, use_sel>::i1;
 
-    virtual ~ResultHandler() {}
+    ResultHandler& the_handler;
+
+    explicit SingleQueryBlockResultHandler(
+            ResultHandler& the_handler_in,
+            const IDSelector* sel_in = nullptr)
+            : BlockResultHandler<C, use_sel>(1, sel_in),
+              the_handler(the_handler_in) {}
+
+    struct SingleResultHandler : ResultHandlerT<C> {
+        ResultHandler& the_handler;
+        using ResultHandlerT<C>::threshold;
+
+        explicit SingleResultHandler(SingleQueryBlockResultHandler& hr)
+                : the_handler(hr.the_handler) {
+            threshold = the_handler.threshold;
+        }
+
+        /// begin results for query # i
+        void begin(const size_t /* qid */) {
+            threshold = the_handler.threshold;
+        }
+
+        /// add one result for query i
+        bool add_result(T dis, TI idx) final {
+            bool updated = the_handler.add_result(dis, idx);
+            threshold = the_handler.threshold;
+            return updated;
+        }
+
+        /// series of results for query i is done
+        void end() {}
+    };
+};
+
+/*****************************************************************
+ * Common ancestor for top-k search results.
+ *****************************************************************/
+
+template <class C, bool use_sel = false>
+struct TopkBlockResultHandler : BlockResultHandler<C, use_sel> {
+    using T = typename C::T;
+    using TI = typename C::TI;
+    T* dis_tab;
+    TI* ids_tab;
+
+    int64_t k; // number of results to keep
+
+    TopkBlockResultHandler(
+            size_t nq_,
+            T* dis_tab_,
+            TI* ids_tab_,
+            size_t k_,
+            const IDSelector* sel_ = nullptr)
+            : BlockResultHandler<C, use_sel>(nq_, sel_),
+              dis_tab(dis_tab_),
+              ids_tab(ids_tab_),
+              k(k_) {}
+
+    ~TopkBlockResultHandler() {}
 };
 
 /*****************************************************************
@@ -77,29 +177,33 @@ struct ResultHandler {
  * some temporary data in memory.
  *****************************************************************/
 
-template <class C>
-struct Top1BlockResultHandler : BlockResultHandler<C> {
+template <class C, bool use_sel = false>
+struct Top1BlockResultHandler : TopkBlockResultHandler<C, use_sel> {
     using T = typename C::T;
     using TI = typename C::TI;
-    using BlockResultHandler<C>::i0;
-    using BlockResultHandler<C>::i1;
+    using BlockResultHandler<C, use_sel>::i0;
+    using BlockResultHandler<C, use_sel>::i1;
 
-    // contains exactly nq elements
-    T* dis_tab;
-    // contains exactly nq elements
-    TI* ids_tab;
+    Top1BlockResultHandler(
+            size_t nq_,
+            T* dis_tab_,
+            TI* ids_tab_,
+            const IDSelector* sel_ = nullptr)
+            : TopkBlockResultHandler<C, use_sel>(
+                      nq_,
+                      dis_tab_,
+                      ids_tab_,
+                      1,
+                      sel_) {}
 
-    Top1BlockResultHandler(size_t nq, T* dis_tab, TI* ids_tab)
-            : BlockResultHandler<C>(nq), dis_tab(dis_tab), ids_tab(ids_tab) {}
-
-    struct SingleResultHandler : ResultHandler<C> {
+    struct SingleResultHandler : ResultHandlerT<C> {
         Top1BlockResultHandler& hr;
-        using ResultHandler<C>::threshold;
+        using ResultHandlerT<C>::threshold;
 
         TI min_idx;
         size_t current_idx = 0;
 
-        explicit SingleResultHandler(Top1BlockResultHandler& hr) : hr(hr) {}
+        explicit SingleResultHandler(Top1BlockResultHandler& hr_) : hr(hr_) {}
 
         /// begin results for query # i
         void begin(const size_t current_idx_2) {
@@ -126,34 +230,20 @@ struct Top1BlockResultHandler : BlockResultHandler<C> {
     };
 
     /// begin
-    void begin_multiple(size_t i0, size_t i1) final {
-        this->i0 = i0;
-        this->i1 = i1;
+    void begin_multiple(size_t i0_in, size_t i1_in) final {
+        this->i0 = i0_in;
+        this->i1 = i1_in;
 
         for (size_t i = i0; i < i1; i++) {
             this->dis_tab[i] = C::neutral();
+            this->ids_tab[i] = -1;
         }
     }
 
-    // todo: NULLPTR
     /// add results for query i0..i1 and j0..j1
-    void add_results(size_t j0, size_t j1, const T* dis_tab_2, const IDSelector* sel) final {
-        for (int64_t i = i0; i < i1; i++) {
-            const T* dis_tab_i = dis_tab_2 + (j1 - j0) * (i - i0) - j0;
-
-            auto& min_distance = this->dis_tab[i];
-            auto& min_index = this->ids_tab[i];
-
-            for (size_t j = j0; j < j1; j++) {
-                const T distance = dis_tab_i[j];
-
-                if (C::cmp(min_distance, distance)) {
-                    min_distance = distance;
-                    min_index = j;
-                }
-            }
-        }
-    }
+    /// Implemented in result_handler.cpp; dispatches via
+    /// with_selected_simd_levels to top1_add_results_tpl<C, use_sel, SL>.
+    void add_results(size_t j0, size_t j1, const T* dis_tab_2) final;
 
     void add_result(const size_t i, const T dis, const TI idx) {
         auto& min_distance = this->dis_tab[i];
@@ -170,75 +260,78 @@ struct Top1BlockResultHandler : BlockResultHandler<C> {
  * Heap based result handler
  *****************************************************************/
 
-template <class C>
-struct HeapBlockResultHandler : BlockResultHandler<C> {
+template <class C, bool use_sel = false>
+struct HeapResultHandler : ResultHandlerT<C> {
     using T = typename C::T;
     using TI = typename C::TI;
-    using BlockResultHandler<C>::i0;
-    using BlockResultHandler<C>::i1;
+    using ResultHandlerT<C>::threshold;
+    size_t k;
 
-    T* heap_dis_tab = nullptr;
-    TI* heap_ids_tab = nullptr;
-    bool own_fields = false;
+    T* heap_dis;
+    TI* heap_ids;
 
-    int64_t k = 0; // number of results to keep
-
-    HeapBlockResultHandler() = default;
-
-    HeapBlockResultHandler(
-            size_t nq,
-            T* heap_dis_tab,
-            TI* heap_ids_tab,
-            size_t k)
-            : BlockResultHandler<C>(nq),
-              heap_dis_tab(heap_dis_tab),
-              heap_ids_tab(heap_ids_tab),
-              k(k) {}
-
-    ~HeapBlockResultHandler() {
-        if (own_fields) {
-            free(heap_dis_tab);
-            free(heap_ids_tab);
+    HeapResultHandler(size_t k_, T* heap_dis_, TI* heap_ids_)
+            : k(k_), heap_dis(heap_dis_), heap_ids(heap_ids_) {
+        if (heap_dis) {
+            this->threshold = heap_dis[0];
         }
     }
+
+    /// add one result for query i
+    bool add_result(T dis, TI idx) final {
+        if (C::cmp(threshold, dis)) {
+            heap_replace_top<C>(k, heap_dis, heap_ids, dis, idx);
+            threshold = heap_dis[0];
+            return true;
+        }
+        return false;
+    }
+};
+
+template <class C, bool use_sel = false>
+struct HeapBlockResultHandler : TopkBlockResultHandler<C, use_sel> {
+    using T = typename C::T;
+    using TI = typename C::TI;
+    using BlockResultHandler<C, use_sel>::i0;
+    using BlockResultHandler<C, use_sel>::i1;
+    using TopkBlockResultHandler<C, use_sel>::k;
+
+    HeapBlockResultHandler(
+            size_t nq_,
+            T* dis_tab_,
+            TI* ids_tab_,
+            size_t k_,
+            const IDSelector* sel_ = nullptr)
+            : TopkBlockResultHandler<C, use_sel>(
+                      nq_,
+                      dis_tab_,
+                      ids_tab_,
+                      k_,
+                      sel_) {}
 
     /******************************************************
      * API for 1 result at a time (each SingleResultHandler is
      * called from 1 thread)
      */
 
-    struct SingleResultHandler : ResultHandler<C> {
+    struct SingleResultHandler : HeapResultHandler<C, use_sel> {
         HeapBlockResultHandler& hr;
-        using ResultHandler<C>::threshold;
-        size_t k;
 
-        T* heap_dis;
-        TI* heap_ids;
-
-        explicit SingleResultHandler(HeapBlockResultHandler& hr)
-                : hr(hr), k(hr.k) {}
+        explicit SingleResultHandler(HeapBlockResultHandler& hr_)
+                : HeapResultHandler<C, use_sel>(hr_.k, nullptr, nullptr),
+                  hr(hr_) {}
 
         /// begin results for query # i
         void begin(size_t i) {
-            heap_dis = hr.heap_dis_tab + i * k;
-            heap_ids = hr.heap_ids_tab + i * k;
-            heap_heapify<C>(k, heap_dis, heap_ids);
-            threshold = heap_dis[0];
-        }
-
-        /// add one result for query i
-        bool add_result(T dis, TI idx) final {
-            if (C::cmp(threshold, dis)) {
-                heap_replace_top<C>(k, heap_dis, heap_ids, dis, idx);
-                threshold = heap_dis[0];
-                return true;
-            }
-            return false;
+            this->heap_dis = hr.dis_tab + i * this->k;
+            this->heap_ids = hr.ids_tab + i * this->k;
+            heap_heapify<C>(this->k, this->heap_dis, this->heap_ids);
+            this->threshold = this->heap_dis[0];
         }
 
         /// series of results for query i is done
         void end() {
-            heap_reorder<C>(k, heap_dis, heap_ids);
+            heap_reorder<C>(this->k, this->heap_dis, this->heap_ids);
         }
     };
 
@@ -251,27 +344,26 @@ struct HeapBlockResultHandler : BlockResultHandler<C> {
         this->i0 = i0_2;
         this->i1 = i1_2;
         for (size_t i = i0; i < i1; i++) {
-            heap_heapify<C>(k, heap_dis_tab + i * k, heap_ids_tab + i * k);
+            heap_heapify<C>(
+                    k, this->dis_tab + i * this->k, this->ids_tab + i * k);
         }
     }
 
-    // todo: NULLPTR
     /// add results for query i0..i1 and j0..j1
-    void add_results(size_t j0, size_t j1, const T* dis_tab,
-                     const IDSelector* sel) final {
+    void add_results(size_t j0, size_t j1, const T* dis_in) final {
 #pragma omp parallel for
-        for (int64_t i = i0; i < i1; i++) {
-            T* heap_dis = heap_dis_tab + i * k;
-            TI* heap_ids = heap_ids_tab + i * k;
-            const T* dis_tab_i = dis_tab + (j1 - j0) * (i - i0) - j0;
+        for (int64_t i = static_cast<int64_t>(i0); i < static_cast<int64_t>(i1);
+             i++) {
+            T* heap_dis = this->dis_tab + i * k;
+            TI* heap_ids = this->ids_tab + i * k;
+            const T* dis_tab_i =
+                    dis_in + (j1 - j0) * (i - static_cast<int64_t>(i0)) - j0;
             T thresh = heap_dis[0];
             for (size_t j = j0; j < j1; j++) {
-                if (!sel || sel->is_member(j)) {
-                    T dis = dis_tab_i[j];
-                    if (C::cmp(thresh, dis)) {
-                        heap_replace_top<C>(k, heap_dis, heap_ids, dis, j);
-                        thresh = heap_dis[0];
-                    }
+                T dis = dis_tab_i[j];
+                if (C::cmp(thresh, dis)) {
+                    heap_replace_top<C>(k, heap_dis, heap_ids, dis, j);
+                    thresh = heap_dis[0];
                 }
             }
         }
@@ -279,9 +371,10 @@ struct HeapBlockResultHandler : BlockResultHandler<C> {
 
     /// series of results for queries i0..i1 is done
     void end_multiple() final {
-        // maybe parallel for
-        for (size_t i = i0; i < i1; i++) {
-            heap_reorder<C>(k, heap_dis_tab + i * k, heap_ids_tab + i * k);
+#pragma omp parallel for schedule(static) if ((i1 - i0) * k >= 1024)
+        for (int64_t i = static_cast<int64_t>(i0); i < static_cast<int64_t>(i1);
+             i++) {
+            heap_reorder<C>(k, this->dis_tab + i * k, this->ids_tab + i * k);
         }
     }
 };
@@ -290,17 +383,17 @@ struct HeapBlockResultHandler : BlockResultHandler<C> {
  * Reservoir result handler
  *
  * A reservoir is a result array of size capacity > n (number of requested
- * results) all results below a threshold are stored in an arbitrary order. When
- * the capacity is reached, a new threshold is chosen by partitionning the
- * distance array.
+ * results) all results below a threshold are stored in an arbitrary order.
+ *When the capacity is reached, a new threshold is chosen by partitioning
+ *the distance array.
  *****************************************************************/
 
 /// Reservoir for a single query
 template <class C>
-struct ReservoirTopN : ResultHandler<C> {
+struct ReservoirTopN : ResultHandlerT<C> {
     using T = typename C::T;
     using TI = typename C::TI;
-    using ResultHandler<C>::threshold;
+    using ResultHandlerT<C>::threshold;
 
     T* vals;
     TI* ids;
@@ -311,8 +404,8 @@ struct ReservoirTopN : ResultHandler<C> {
 
     ReservoirTopN() {}
 
-    ReservoirTopN(size_t n, size_t capacity, T* vals, TI* ids)
-            : vals(vals), ids(ids), i(0), n(n), capacity(capacity) {
+    ReservoirTopN(size_t n_, size_t capacity_, T* vals_, TI* ids_)
+            : vals(vals_), ids(ids_), i(0), n(n_), capacity(capacity_) {
         assert(n < capacity);
         threshold = C::neutral();
     }
@@ -350,7 +443,7 @@ struct ReservoirTopN : ResultHandler<C> {
     }
 
     void to_result(T* heap_dis, TI* heap_ids) const {
-        for (int j = 0; j < std::min(i, n); j++) {
+        for (size_t j = 0; j < std::min(i, n); j++) {
             heap_push<C>(j + 1, heap_dis, heap_ids, vals[j], ids[j]);
         }
 
@@ -366,41 +459,30 @@ struct ReservoirTopN : ResultHandler<C> {
     }
 };
 
-template <class C>
-struct ReservoirBlockResultHandler : BlockResultHandler<C> {
+template <class C, bool use_sel = false>
+struct ReservoirBlockResultHandler : TopkBlockResultHandler<C, use_sel> {
     using T = typename C::T;
     using TI = typename C::TI;
-    using BlockResultHandler<C>::i0;
-    using BlockResultHandler<C>::i1;
+    using BlockResultHandler<C, use_sel>::i0;
+    using BlockResultHandler<C, use_sel>::i1;
+    using TopkBlockResultHandler<C, use_sel>::k;
 
-    T* heap_dis_tab = nullptr;
-    TI* heap_ids_tab = nullptr;
-
-    int64_t k = 0;       // number of results to keep
-    size_t capacity = 0; // capacity of the reservoirs
-    bool own_fields = false;
+    size_t capacity; // capacity of the reservoirs
 
     ReservoirBlockResultHandler(
-            size_t nq,
-            T* heap_dis_tab,
-            TI* heap_ids_tab,
-            size_t k)
-            : BlockResultHandler<C>(nq),
-              heap_dis_tab(heap_dis_tab),
-              heap_ids_tab(heap_ids_tab),
-              k(k),
-              own_fields(false) {
+            size_t nq_,
+            T* dis_tab_,
+            TI* ids_tab_,
+            size_t k_,
+            const IDSelector* sel_ = nullptr)
+            : TopkBlockResultHandler<C, use_sel>(
+                      nq_,
+                      dis_tab_,
+                      ids_tab_,
+                      k_,
+                      sel_) {
         // double then round up to multiple of 16 (for SIMD alignment)
         capacity = (2 * k + 15) & ~15;
-    }
-
-    ReservoirBlockResultHandler() = default;
-
-    ~ReservoirBlockResultHandler() {
-        if (own_fields) {
-            free(heap_dis_tab);
-            free(heap_ids_tab);
-        }
     }
 
     /******************************************************
@@ -414,9 +496,9 @@ struct ReservoirBlockResultHandler : BlockResultHandler<C> {
         std::vector<T> reservoir_dis;
         std::vector<TI> reservoir_ids;
 
-        explicit SingleResultHandler(ReservoirBlockResultHandler& hr)
-                : ReservoirTopN<C>(hr.k, hr.capacity, nullptr, nullptr),
-                  hr(hr) {}
+        explicit SingleResultHandler(ReservoirBlockResultHandler& hr_)
+                : ReservoirTopN<C>(hr_.k, hr_.capacity, nullptr, nullptr),
+                  hr(hr_) {}
 
         size_t qno;
 
@@ -433,8 +515,8 @@ struct ReservoirBlockResultHandler : BlockResultHandler<C> {
 
         /// series of results for query qno is done
         void end() {
-            T* heap_dis = hr.heap_dis_tab + qno * hr.k;
-            TI* heap_ids = hr.heap_ids_tab + qno * hr.k;
+            T* heap_dis = hr.dis_tab + qno * hr.k;
+            TI* heap_ids = hr.ids_tab + qno * hr.k;
             this->to_result(heap_dis, heap_ids);
         }
     };
@@ -456,36 +538,25 @@ struct ReservoirBlockResultHandler : BlockResultHandler<C> {
         reservoirs.clear();
         for (size_t i = i0_2; i < i1_2; i++) {
             reservoirs.emplace_back(
-                    k,
+                    this->k,
                     capacity,
                     reservoir_dis.data() + (i - i0_2) * capacity,
                     reservoir_ids.data() + (i - i0_2) * capacity);
         }
     }
 
-    // todo: NULLPTR
     /// add results for query i0..i1 and j0..j1
-    void add_results(size_t j0, size_t j1, const T* dis_tab,
-                     const IDSelector* sel) {
-#pragma omp parallel for
-        for (int64_t i = i0; i < i1; i++) {
-            ReservoirTopN<C>& reservoir = reservoirs[i - i0];
-            const T* dis_tab_i = dis_tab + (j1 - j0) * (i - i0) - j0;
-            for (size_t j = j0; j < j1; j++) {
-                if (!sel || sel->is_member(j)) {
-                    T dis = dis_tab_i[j];
-                    reservoir.add_result(dis, j);
-                }
-            }
-        }
-    }
+    /// Implemented in result_handler.cpp; dispatches via
+    /// with_selected_simd_levels to reservoir_add_results_tpl<C, use_sel, SL>.
+    void add_results(size_t j0, size_t j1, const T* dis_in);
 
     /// series of results for queries i0..i1 is done
     void end_multiple() final {
-        // maybe parallel for
-        for (size_t i = i0; i < i1; i++) {
-            reservoirs[i - i0].to_result(
-                    heap_dis_tab + i * k, heap_ids_tab + i * k);
+#pragma omp parallel for schedule(static) if ((i1 - i0) * this->k >= 1024)
+        for (int64_t i = static_cast<int64_t>(i0); i < static_cast<int64_t>(i1);
+             i++) {
+            reservoirs[i - static_cast<int64_t>(i0)].to_result(
+                    this->dis_tab + i * this->k, this->ids_tab + i * this->k);
         }
     }
 };
@@ -494,46 +565,62 @@ struct ReservoirBlockResultHandler : BlockResultHandler<C> {
  * Result handler for range searches
  *****************************************************************/
 
-template <class C>
-struct RangeSearchBlockResultHandler : BlockResultHandler<C> {
+template <class C, bool use_sel = false>
+struct RangeResultHandler : ResultHandlerT<C> {
     using T = typename C::T;
     using TI = typename C::TI;
-    using BlockResultHandler<C>::i0;
-    using BlockResultHandler<C>::i1;
+    using ResultHandlerT<C>::threshold;
+
+    RangeQueryResult* qr = nullptr;
+
+    RangeResultHandler(RangeQueryResult* qr_, T threshold_) : qr(qr_) {
+        this->threshold = threshold_;
+    }
+
+    /// add one result for query i
+    bool add_result(T dis, TI idx) final {
+        if (C::cmp(threshold, dis)) {
+            qr->add(dis, idx);
+            return true;
+        }
+        return false;
+    }
+};
+
+template <class C, bool use_sel = false>
+struct RangeSearchBlockResultHandler : BlockResultHandler<C, use_sel> {
+    using T = typename C::T;
+    using TI = typename C::TI;
+    using BlockResultHandler<C, use_sel>::i0;
+    using BlockResultHandler<C, use_sel>::i1;
 
     RangeSearchResult* res;
     T radius;
 
-    RangeSearchBlockResultHandler(RangeSearchResult* res, float radius)
-            : BlockResultHandler<C>(res->nq), res(res), radius(radius) {}
+    RangeSearchBlockResultHandler(
+            RangeSearchResult* res_,
+            float radius_,
+            const IDSelector* sel_ = nullptr)
+            : BlockResultHandler<C, use_sel>(res_->nq, sel_),
+              res(res_),
+              radius(radius_) {}
 
     /******************************************************
      * API for 1 result at a time (each SingleResultHandler is
      * called from 1 thread)
      ******************************************************/
 
-    struct SingleResultHandler : ResultHandler<C> {
+    struct SingleResultHandler : RangeResultHandler<C> {
         // almost the same interface as RangeSearchResultHandler
-        using ResultHandler<C>::threshold;
+        using ResultHandlerT<C>::threshold;
         RangeSearchPartialResult pres;
-        RangeQueryResult* qr = nullptr;
 
         explicit SingleResultHandler(RangeSearchBlockResultHandler& rh)
-                : pres(rh.res) {
-            threshold = rh.radius;
-        }
+                : RangeResultHandler<C>(nullptr, rh.radius), pres(rh.res) {}
 
         /// begin results for query # i
         void begin(size_t i) {
-            qr = &pres.new_result(i);
-        }
-
-        /// add one result for query i
-        bool add_result(T dis, TI idx) final {
-            if (C::cmp(threshold, dis)) {
-                qr->add(dis, idx);
-            }
-            return false;
+            this->qr = &pres.new_result(i);
         }
 
         /// series of results for query i is done
@@ -543,8 +630,9 @@ struct RangeSearchBlockResultHandler : BlockResultHandler<C> {
             try {
                 // finalize the partial result
                 pres.finalize();
-            } catch (const faiss::FaissException& e) {
-                // Do nothing if allocation fails in finalizing partial results.
+            } catch ([[maybe_unused]] const faiss::FaissException& e) {
+                // Do nothing if allocation fails in finalizing partial
+                // results.
 #ifndef NDEBUG
                 std::cerr << e.what() << std::endl;
 #endif
@@ -566,17 +654,16 @@ struct RangeSearchBlockResultHandler : BlockResultHandler<C> {
         this->i1 = i1_2;
     }
 
-    // todo: NULLPTR
     /// add results for query i0..i1 and j0..j1
-    void add_results(size_t j0, size_t j1, const T* dis_tab,
-                     const IDSelector* sel) {
+
+    void add_results(size_t j0, size_t j1, const T* dis_tab) {
         RangeSearchPartialResult* pres;
         // there is one RangeSearchPartialResult structure per j0
         // (= block of columns of the large distance matrix)
-        // it is a bit tricky to find the poper PartialResult structure
+        // it is a bit tricky to find the proper PartialResult structure
         // because the inner loop is on db not on queries.
 
-        if (pr < j0s.size() && j0 == j0s[pr]) {
+        if (static_cast<size_t>(pr) < j0s.size() && j0 == j0s[pr]) {
             pres = partial_results[pr];
             pr++;
         } else if (j0 == 0 && j0s.size() > 0) {
@@ -595,13 +682,10 @@ struct RangeSearchBlockResultHandler : BlockResultHandler<C> {
             RangeQueryResult& qres = pres->new_result(i);
 
             for (size_t j = j0; j < j1; j++) {
-                if (!sel || sel->is_member(j)) {
-                    float dis = *ip_line;
-                    if (C::cmp(radius, dis)) {
-                        qres.add(dis, j);
-                    }
+                float dis = *ip_line++;
+                if (C::cmp(radius, dis)) {
+                    qres.add(dis, j);
                 }
-                ip_line++;
             }
         }
     }
@@ -611,7 +695,7 @@ struct RangeSearchBlockResultHandler : BlockResultHandler<C> {
             if (partial_results.size() > 0) {
                 RangeSearchPartialResult::merge(partial_results);
             }
-        } catch (const faiss::FaissException& e) {
+        } catch ([[maybe_unused]] const faiss::FaissException& e) {
             // Do nothing if allocation fails in merge.
 #ifndef NDEBUG
             std::cerr << e.what() << std::endl;
@@ -620,65 +704,99 @@ struct RangeSearchBlockResultHandler : BlockResultHandler<C> {
     }
 };
 
-template <class C>
-struct CollectAllResultHandler : BlockResultHandler<C> {
-    using T = typename C::T;
-    using TI = typename C::TI;
-    using BlockResultHandler<C>::i0;
-    using BlockResultHandler<C>::i1;
+/*****************************************************************
+ * Dispatcher function to choose the right knn result handler depending on k
+ *****************************************************************/
 
-    CollectAllResultHandler(size_t nq, size_t ny_in, std::vector<knowhere::IdVal<TI, T>>& output)
-            : BlockResultHandler<C>(nq), ny{ny_in}, output(output) {}
+// declared in distances.cpp
+FAISS_API extern int distance_compute_min_k_reservoir;
 
-    size_t ny;
-    std::vector<knowhere::IdVal<TI, T>>& output;
-
-    struct SingleResultHandler {
-        CollectAllResultHandler& all_handler;
-
-        knowhere::IdVal<TI, T>* target;
-
-        SingleResultHandler(CollectAllResultHandler& all_handler) : all_handler(all_handler) {}
-
-        /// begin results for query # i
-        void begin(size_t i) {
-            target = all_handler.output.data() + i * all_handler.ny;
-        }
-
-        /// add one result for query i
-        void add_result(T dis, TI idx) {
-            target[idx] = {idx, dis};
-        }
-
-        void end() {}
-    };
-
-    /******************************************************
-     * API for multiple results (called from 1 thread)
-     */
-
-    void begin_multiple(size_t i0, size_t i1) {
-        this->i0 = i0;
-        this->i1 = i1;
+template <class Consumer, class... Types>
+typename Consumer::T dispatch_knn_ResultHandler(
+        size_t nx,
+        float* vals,
+        int64_t* ids,
+        size_t k,
+        MetricType metric,
+        const IDSelector* sel,
+        Consumer& consumer,
+        Types... args) {
+#define DISPATCH_C_SEL(C, use_sel)                                          \
+    if (k == 1) {                                                           \
+        Top1BlockResultHandler<C, use_sel> res(nx, vals, ids, sel);         \
+        return consumer.template f<>(res, args...);                         \
+    } else if (k < static_cast<size_t>(distance_compute_min_k_reservoir)) { \
+        HeapBlockResultHandler<C, use_sel> res(nx, vals, ids, k, sel);      \
+        return consumer.template f<>(res, args...);                         \
+    } else {                                                                \
+        ReservoirBlockResultHandler<C, use_sel> res(nx, vals, ids, k, sel); \
+        return consumer.template f<>(res, args...);                         \
     }
 
-    // todo: NULLPTR
-    void add_results(size_t j0, size_t j1, const T* dis_tab,
-                     const IDSelector* sel) {
-#pragma omp parallel for
-        for (int64_t i = i0; i < i1; i++) {
-            auto* target = output.data() + i * ny;
-            const T* dis_tab_i = dis_tab + (j1 - j0) * (i - i0) - j0;
-            for (size_t j = j0; j < j1; j++) {
-                if (!sel || sel->is_member(j)) {
-                    T dis = dis_tab_i[j];
-                    target[j] = {(int64_t)j, dis};
-                }
-            }
+    if (is_similarity_metric(metric)) {
+        using C = CMin<float, int64_t>;
+        if (sel) {
+            DISPATCH_C_SEL(C, true);
+        } else {
+            DISPATCH_C_SEL(C, false);
+        }
+    } else {
+        using C = CMax<float, int64_t>;
+        if (sel) {
+            DISPATCH_C_SEL(C, true);
+        } else {
+            DISPATCH_C_SEL(C, false);
         }
     }
+#undef DISPATCH_C_SEL
+}
 
-    void end_multiple() {}
-};
+template <class Consumer, class... Types>
+typename Consumer::T dispatch_range_ResultHandler(
+        RangeSearchResult* res,
+        float radius,
+        MetricType metric,
+        const IDSelector* sel,
+        Consumer& consumer,
+        Types... args) {
+#define DISPATCH_C_SEL(C, use_sel)                                    \
+    RangeSearchBlockResultHandler<C, use_sel> resb(res, radius, sel); \
+    return consumer.template f<>(resb, args...);
+
+    if (is_similarity_metric(metric)) {
+        using C = CMin<float, int64_t>;
+        if (sel) {
+            DISPATCH_C_SEL(C, true);
+        } else {
+            DISPATCH_C_SEL(C, false);
+        }
+    } else {
+        using C = CMax<float, int64_t>;
+        if (sel) {
+            DISPATCH_C_SEL(C, true);
+        } else {
+            DISPATCH_C_SEL(C, false);
+        }
+    }
+#undef DISPATCH_C_SEL
+}
+
+// ------------------------------------------------------------------
+// SIMD-dispatch entry points for Top1 and Reservoir add_results.
+// ------------------------------------------------------------------
+
+template <class C, bool use_sel, SIMDLevel SL>
+void top1_add_results_tpl(
+        Top1BlockResultHandler<C, use_sel>* self,
+        size_t j0,
+        size_t j1,
+        const typename C::T* dis_tab);
+
+template <class C, bool use_sel, SIMDLevel SL>
+void reservoir_add_results_tpl(
+        ReservoirBlockResultHandler<C, use_sel>* self,
+        size_t j0,
+        size_t j1,
+        const typename C::T* dis_in);
 
 } // namespace faiss

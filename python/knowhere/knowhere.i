@@ -17,9 +17,11 @@ typedef uint64_t size_t;
 %ignore knowhere::IndexNode;
 %ignore knowhere::Index;
 %ignore knowhere::expected;
+%ignore knowhere::Interrupt;
 %{
 #include <stdint.h>
 #include <memory>
+#include <stdexcept>
 #ifdef SWIGPYTHON
 #undef popcount64
 #define SWIG_FILE_WITH_INIT
@@ -31,15 +33,21 @@ typedef uint64_t size_t;
 #include <knowhere/index/index_factory.h>
 #include <knowhere/version.h>
 #include <knowhere/utils.h>
-#include <knowhere/operands.h>
+#include <knowhere/sparse_utils.h>
+#include "knowhere/operands.h"
 #include <knowhere/comp/brute_force.h>
 #include <knowhere/comp/knowhere_config.h>
-#include <knowhere/comp/local_file_manager.h>
-#include <knowhere/comp/task.h>
+#include <filemanager/impl/LocalFileManager.h>
 #include <knowhere/comp/index_param.h>
 #include <fstream>
 #include <string>
 using namespace knowhere;
+
+#if SWIG_VERSION >= 0x040300
+#define KNOWHERE_SWIG_PYTHON_APPEND_OUTPUT(result, obj, is_void) SWIG_Python_AppendOutput(result, obj, is_void)
+#else
+#define KNOWHERE_SWIG_PYTHON_APPEND_OUTPUT(result, obj, is_void) SWIG_Python_AppendOutput(result, obj)
+#endif
 %}
 
 %{
@@ -74,14 +82,21 @@ import_array();
 %apply (int* IN_ARRAY2, int DIM1, int DIM2) {(int* xb, int nb, int dim)}
 %apply (uint8_t *IN_ARRAY1, int DIM1) {(uint8_t *block, int size)}
 %apply (uint8_t* IN_ARRAY2, int DIM1, int DIM2) {(uint8_t* xb, int nb, int dim)}
-%apply (uint8_t* INPLACE_ARRAY2, int DIM1, int DIM2) {(uint8_t *data,int rows,int dim)}
+%apply (uint8_t* INPLACE_ARRAY2, int DIM1, int DIM2) {(uint8_t *data, int rows, int dim)}
+%apply (int8_t* IN_ARRAY2, int DIM1, int DIM2) {(int8_t* xb, int nb, int dim)}
+%apply (int8_t* INPLACE_ARRAY2, int DIM1, int DIM2) {(int8_t *data, int rows, int dim)}
 %apply (int *IN_ARRAY1, int DIM1) {(int *lims, int len)}
 %apply (int *IN_ARRAY1, int DIM1) {(int *ids, int len)}
 %apply (float *IN_ARRAY1, int DIM1) {(float *dis, int len)}
+%apply (float *IN_ARRAY1, int DIM1) {(float *data, int nb1)}
+%apply (int *IN_ARRAY1, int DIM1) {(int *ids, int nb2)}
+%apply (int64_t *IN_ARRAY1, int DIM1) {(int64_t* indptr, int nb3)}
 %apply (float* INPLACE_ARRAY2, int DIM1, int DIM2){(float *dis,int nq_1,int k_1)}
 %apply (int *INPLACE_ARRAY2, int DIM1, int DIM2){(int *ids,int nq_2,int k_2)}
 %apply (float* INPLACE_ARRAY2, int DIM1, int DIM2){(float *data,int rows,int dim)}
 %apply (int32_t *INPLACE_ARRAY2, int DIM1, int DIM2){(int32_t *data,int rows,int dim)}
+%apply (float* IN_ARRAY2, int DIM1, int DIM2){(float* xb, int nb, int dim)}
+%apply (int *IN_ARRAY1, int DIM1){(int* offsets, int offset_size)}
 
 %typemap(in, numinputs=0) knowhere::Status& status(knowhere::Status tmp) %{
     $1 = &tmp;
@@ -89,7 +104,7 @@ import_array();
 %typemap(argout) knowhere::Status& status %{
     PyObject *o;
     o = PyInt_FromLong(long(*$1));
-    $result = SWIG_Python_AppendOutput($result, o);
+    $result = KNOWHERE_SWIG_PYTHON_APPEND_OUTPUT($result, o, 0);
 %}
 
 %pythoncode %{
@@ -134,11 +149,19 @@ class AnnIteratorWrap {
     }
 
     bool HasNext() {
-        return it_->HasNext();
+        auto has_next = it_->HasNext();
+        if (!has_next.has_value()) {
+            throw std::runtime_error("ann iterator HasNext failed: " + has_next.what());
+        }
+        return has_next.value();
     }
 
     std::pair<int64_t, float> Next() {
-        return it_->Next();
+        auto next = it_->Next();
+        if (!next.has_value()) {
+            throw std::runtime_error("ann iterator Next failed: " + next.what());
+        }
+        return next.value();
     }
 
  private:
@@ -150,8 +173,8 @@ class IndexWrap {
  public:
     IndexWrap(const std::string& name, const int32_t& version) {
         GILReleaser rel;
-        if (name == std::string(knowhere::IndexEnum::INDEX_DISKANN)) {
-            std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
+        if (name == std::string(knowhere::IndexEnum::INDEX_DISKANN) || name == std::string(knowhere::IndexEnum::INDEX_CARDINAL_TIERED)) {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
             auto diskann_pack = knowhere::Pack(file_manager);
             idx = IndexFactory::Instance().Create<T>(name, version,
             diskann_pack);
@@ -163,25 +186,25 @@ class IndexWrap {
     knowhere::Status
     Build(knowhere::DataSetPtr dataset, const std::string& json) {
         GILReleaser rel;
-        return idx.value().Build(*dataset, knowhere::Json::parse(json));
+        return idx.value().Build(dataset, knowhere::Json::parse(json));
     }
 
     knowhere::Status
     Train(knowhere::DataSetPtr dataset, const std::string& json) {
         GILReleaser rel;
-        return idx.value().Train(*dataset, knowhere::Json::parse(json));
+        return idx.value().Train(dataset, knowhere::Json::parse(json));
     }
 
     knowhere::Status
     Add(knowhere::DataSetPtr dataset, const std::string& json) {
         GILReleaser rel;
-        return idx.value().Add(*dataset, knowhere::Json::parse(json));
+        return idx.value().Add(dataset, knowhere::Json::parse(json));
     }
 
     knowhere::DataSetPtr
     Search(knowhere::DataSetPtr dataset, const std::string& json, const knowhere::BitsetView& bitset, knowhere::Status& status) {
         GILReleaser rel;
-        auto res = idx.value().Search(*dataset, knowhere::Json::parse(json), bitset);
+        auto res = idx.value().Search(dataset, knowhere::Json::parse(json), bitset);
         if (res.has_value()) {
             status = knowhere::Status::success;
             return res.value();
@@ -194,7 +217,7 @@ class IndexWrap {
     std::vector<AnnIteratorWrap>
     GetAnnIterator(knowhere::DataSetPtr dataset, const std::string& json, const knowhere::BitsetView& bitset, knowhere::Status& status) {
         GILReleaser rel;
-        auto res = idx.value().AnnIterator(*dataset, knowhere::Json::parse(json), bitset);
+        auto res = idx.value().AnnIterator(dataset, knowhere::Json::parse(json), bitset);
         std::vector<AnnIteratorWrap> result;
         if (!res.has_value()) {
             status = res.error();
@@ -210,7 +233,7 @@ class IndexWrap {
     knowhere::DataSetPtr
     RangeSearch(knowhere::DataSetPtr dataset, const std::string& json, const knowhere::BitsetView& bitset, knowhere::Status& status){
         GILReleaser rel;
-        auto res = idx.value().RangeSearch(*dataset, knowhere::Json::parse(json), bitset);
+        auto res = idx.value().RangeSearch(dataset, knowhere::Json::parse(json), bitset);
         if (res.has_value()) {
             status = knowhere::Status::success;
             return res.value();
@@ -223,7 +246,7 @@ class IndexWrap {
     knowhere::DataSetPtr
     GetVectorByIds(knowhere::DataSetPtr dataset, knowhere::Status& status) {
         GILReleaser rel;
-        auto res = idx.value().GetVectorByIds(*dataset);
+        auto res = idx.value().GetVectorByIds(dataset);
         if (res.has_value()) {
             status = knowhere::Status::success;
             return res.value();
@@ -307,18 +330,41 @@ GetNullBitSetView() {
     return nullptr;
 };
 
+void setOffsets(knowhere::DataSetPtr ds, int* offsets, int offset_size) {
+    if (offset_size <= 0) {
+        throw std::invalid_argument("embedding-list offsets must contain at least the initial offset");
+    }
+    size_t* offsets_ = new size_t[offset_size];
+    for (int i = 0; i < offset_size; ++i) {
+        offsets_[i] = (size_t)(offsets[i]);
+    }
+    ds->Set(knowhere::meta::EMB_LIST_OFFSET, const_cast<const size_t*>(offsets_));
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(offset_size - 1));
+}
+
 knowhere::DataSetPtr
-Array2DataSetF(float* xb, int nb, int dim) {
+Array2DataSetF(float* xb, int nb, int dim, int* offsets=nullptr, int offset_size=0) {
     auto ds = std::make_shared<DataSet>();
-    ds->SetIsOwner(false);
     ds->SetRows(nb);
     ds->SetDim(dim);
-    ds->SetTensor(xb);
+
+    if (offsets != nullptr) {
+        ds->SetIsOwner(true);
+        float* xb_ = new float[nb * dim];
+        for (int i = 0; i < nb * dim; ++i) {
+            xb_[i] = (float)xb[i];
+        }
+        ds->SetTensor(xb_);
+        setOffsets(ds, offsets, offset_size);
+    } else {
+        ds->SetIsOwner(false);
+        ds->SetTensor(xb);
+    }
     return ds;
 };
 
 knowhere::DataSetPtr
-Array2DataSetFP16(float* xb, int nb, int dim) {
+Array2DataSetFP16(float* xb, int nb, int dim, int* offsets=nullptr, int offset_size=0) {
     auto ds = std::make_shared<DataSet>();
     ds->SetIsOwner(true);
     ds->SetRows(nb);
@@ -329,12 +375,16 @@ Array2DataSetFP16(float* xb, int nb, int dim) {
         fp16_data[i] = knowhere::fp16(xb[i]);
     }
     ds->SetTensor(fp16_data);
+    if (offsets != nullptr) {
+        setOffsets(ds, offsets, offset_size);
+    }
     return ds;
 };
+
 #pragma GCC push_options
 #pragma GCC optimize("O0")
 knowhere::DataSetPtr
-Array2DataSetBF16(float* xb, int nb, int dim) {
+Array2DataSetBF16(float* xb, int nb, int dim, int* offsets=nullptr, int offset_size=0) {
     using bf16 = knowhere::bf16;
     auto ds = std::make_shared<DataSet>();
     ds->SetIsOwner(true);
@@ -344,8 +394,10 @@ Array2DataSetBF16(float* xb, int nb, int dim) {
     for (int i = 0; i < nb * dim; ++i) {
         bf16_data[i] = knowhere::bf16(xb[i]);
     }
-
     ds->SetTensor(bf16_data);
+    if (offsets != nullptr) {
+        setOffsets(ds, offsets, offset_size);
+    }
     return ds;
 };
 #pragma GCC pop_options
@@ -356,12 +408,61 @@ CurrentVersion() {
 }
 
 knowhere::DataSetPtr
-Array2DataSetI(uint8_t* xb, int nb, int dim) {
+Array2SparseDataSet(float* data, int nb1, int* ids, int nb2, int64_t* indptr, int nb3) {
+    int rows = nb3 - 1;
+    int cols = 0;
+    for (auto i = 0; i < nb2; ++i) {
+        if (ids[i] < 0) {
+            throw std::runtime_error("sparse matrix indics wrong");
+        }
+        cols = std::max(ids[i] + 1, cols);
+    }
+    auto ds = std::make_shared<DataSet>();
+    auto tensor = std::make_unique<knowhere::sparse::SparseRow<float>[]>(rows);
+
+    for (int32_t i = 0; i < rows; ++i) {
+        int64_t start = indptr[i];
+        int64_t end = indptr[i+1];
+        if (start == end) {
+            throw std::runtime_error("sparse matrix indptr wrong");
+        }
+        knowhere::sparse::SparseRow<float> row(end - start);
+        for (auto j = start; j < end; ++j) {
+            row.set_at(j - start, ids[j], data[j]);
+        }
+        tensor[i] = std::move(row);
+    }
+    ds->SetRows(rows);
+    ds->SetDim(cols);
+    ds->SetTensor(tensor.release());
+    ds->SetIsOwner(true);
+    ds->SetIsSparse(true);
+    return ds;
+}
+
+knowhere::DataSetPtr
+Array2DataSetU(uint8_t* xb, int nb, int dim, int* offsets=nullptr, int offset_size=0) {
     auto ds = std::make_shared<DataSet>();
     ds->SetIsOwner(false);
     ds->SetRows(nb);
     ds->SetDim(dim*8);
     ds->SetTensor(xb);
+    if (offsets != nullptr) {
+        setOffsets(ds, offsets, offset_size);
+    }
+    return ds;
+};
+
+knowhere::DataSetPtr
+Array2DataSetI(int8_t* xb, int nb, int dim, int* offsets=nullptr, int offset_size=0) {
+    auto ds = std::make_shared<DataSet>();
+    ds->SetIsOwner(false);
+    ds->SetRows(nb);
+    ds->SetDim(dim);
+    ds->SetTensor(xb);
+    if (offsets != nullptr) {
+        setOffsets(ds, offsets, offset_size);
+    }
     return ds;
 };
 
@@ -482,6 +583,17 @@ BinaryDataSetTensor2Array(knowhere::DataSetPtr result, uint8_t* data, int rows, 
 }
 
 void
+Int8DataSetTensor2Array(knowhere::DataSetPtr result, int8_t* data, int rows, int dim) {
+    GILReleaser rel;
+    auto data_ = result->GetTensor();
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < dim; ++j) {
+            *(data + i * dim + j) = *((knowhere::int8*)(data_) + i * dim + j);
+        }
+    }
+}
+
+void
 DumpRangeResultIds(knowhere::DataSetPtr result, int* ids, int len) {
     GILReleaser rel;
     auto ids_ = result->GetIds();
@@ -513,20 +625,21 @@ Dump(knowhere::BinarySetPtr binset, const std::string& file_name) {
     auto binary_set = *binset;
     auto binary_map = binset -> binary_map_;
     std::ofstream outfile;
-    outfile.open(file_name, std::ios::out | std::ios::trunc);
+    outfile.open(file_name, std::ios::out | std::ios::trunc | std::ios::binary);
     if (outfile.good()) {
         for (auto it = binary_map.begin(); it != binary_map.end(); ++it) {
             // serialization: name_length(size_t); name(char[]); binset_size(size_t); binset(uint8[]);
             auto name = it->first;
             uint64_t name_len = name.size();
-            outfile << name_len;
-            outfile << name;
+            outfile.write(reinterpret_cast<char*>(&name_len), sizeof(uint64_t));
+            outfile.write(reinterpret_cast<char*>(name.data()), name.size());
             auto value = it->second;
-            outfile << value->size;
+            outfile.write(reinterpret_cast<char*>(&value->size), sizeof(int64_t));
             outfile.write(reinterpret_cast<char*>(value->data.get()), value->size);
         }
         // end with 0
-        outfile << 0;
+        uint64_t end_marker = 0;
+        outfile.write(reinterpret_cast<char*>(&end_marker), sizeof(uint64_t));
         outfile.flush();
     }
 }
@@ -534,25 +647,25 @@ Dump(knowhere::BinarySetPtr binset, const std::string& file_name) {
 void
 Load(knowhere::BinarySetPtr binset, const std::string& file_name) {
     std::ifstream infile;
-    infile.open(file_name, std::ios::in);
+    infile.open(file_name, std::ios::in | std::ios::binary);
     if (infile.good()) {
         uint64_t name_len;
         while (true) {
             // deserialization: name_length(size_t); name(char[]); binset_size(size_t); binset(uint8[]);
-            infile >> name_len;
+            infile.read(reinterpret_cast<char*>(&name_len), sizeof(uint64_t));
             if (name_len == 0) break;
 
             auto _name = new char[name_len];
             infile.read(_name, name_len);
             std::string name(_name, name_len);
-
             int64_t size;
-            infile >> size;
+            infile.read(reinterpret_cast<char*>(&size), sizeof(int64_t));
             if (size > 0) {
                 auto data = new uint8_t[size];
                 std::shared_ptr<uint8_t[]> data_ptr(data);
                 infile.read(reinterpret_cast<char*>(data_ptr.get()), size);
                 binset->Append(name, data_ptr, size);
+                printf("name: %s, size: %ld\n", name.c_str(), size);
             }
         }
     }
@@ -582,7 +695,12 @@ knowhere::DataSetPtr
 BruteForceSearch(knowhere::DataSetPtr base_dataset, knowhere::DataSetPtr query_dataset, const std::string& json,
                  const knowhere::BitsetView& bitset, knowhere::Status& status) {
     GILReleaser rel;
-    auto res = knowhere::BruteForce::Search<T>(base_dataset, query_dataset, knowhere::Json::parse(json), bitset);
+    expected<knowhere::DataSetPtr> res;
+    if (base_dataset->GetIsSparse()) {
+        res = knowhere::BruteForce::SearchSparse(base_dataset, query_dataset, knowhere::Json::parse(json), bitset);
+    } else {
+        res = knowhere::BruteForce::Search<T>(base_dataset, query_dataset, knowhere::Json::parse(json), bitset);
+    }
     if (res.has_value()) {
         status = knowhere::Status::success;
         return res.value();
@@ -624,12 +742,12 @@ SetSimdType(const std::string type) {
 
 void
 SetBuildThreadPool(uint32_t num_threads) {
-    knowhere::InitBuildThreadPool(num_threads);
+    knowhere::KnowhereConfig::SetBuildThreadPoolSize(num_threads);
 }
 
 void
 SetSearchThreadPool(uint32_t num_threads) {
-    knowhere::InitSearchThreadPool(num_threads);
+    knowhere::KnowhereConfig::SetSearchThreadPoolSize(num_threads);
 }
 
 %}
@@ -640,13 +758,16 @@ SetSearchThreadPool(uint32_t num_threads) {
 %template(IndexWrapFP16) IndexWrap<knowhere::fp16>;
 %template(IndexWrapBF16) IndexWrap<knowhere::bf16>;
 %template(IndexWrapBin) IndexWrap<knowhere::bin1>;
+%template(IndexWrapInt8) IndexWrap<knowhere::int8>;
 
 %template(BruteForceSearchFloat) BruteForceSearch<float>;
 %template(BruteForceSearchFP16) BruteForceSearch<knowhere::fp16>;
 %template(BruteForceSearchBF16) BruteForceSearch<knowhere::bf16>;
+%template(BruteForceSearchInt8) BruteForceSearch<knowhere::int8>;
 %template(BruteForceSearchBin) BruteForceSearch<knowhere::bin1>;
 
 %template(BruteForceRangeSearchFloat) BruteForceRangeSearch<float>;
 %template(BruteForceRangeSearchFP16) BruteForceRangeSearch<knowhere::fp16>;
 %template(BruteForceRangeSearchBF16) BruteForceRangeSearch<knowhere::bf16>;
+%template(BruteForceRangeSearchInt8) BruteForceRangeSearch<knowhere::int8>;
 %template(BruteForceRangeSearchBin) BruteForceRangeSearch<knowhere::bin1>;

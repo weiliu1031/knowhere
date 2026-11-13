@@ -14,78 +14,73 @@
 
 #include "knowhere/index/index_node_data_mock_wrapper.h"
 
-#include "knowhere/comp/thread_pool.h"
 #include "knowhere/index/index_node.h"
+#include "knowhere/thread_pool.h"
 #include "knowhere/utils.h"
 
 namespace knowhere {
 
 template <typename DataType>
 Status
-IndexNodeDataMockWrapper<DataType>::Build(const DataSet& dataset, const Config& cfg) {
-    std::shared_ptr<const DataSet> ds_ptr = dataset.shared_from_this();
-    if constexpr (!std::is_same_v<DataType, typename MockData<DataType>::type>) {
-        ds_ptr = data_type_conversion<DataType, typename MockData<DataType>::type>(dataset);
-    }
-    return index_node_->Build(*ds_ptr, cfg);
+IndexNodeDataMockWrapper<DataType>::Build(const DataSetPtr dataset, std::shared_ptr<Config> cfg,
+                                          bool use_knowhere_build_pool, milvus::OpContext* op_context) {
+    auto ds_ptr = ConvertFromDataTypeIfNeeded<DataType>(dataset);
+    return index_node_->Build(ds_ptr, std::move(cfg), use_knowhere_build_pool, op_context);
 }
 
 template <typename DataType>
 Status
-IndexNodeDataMockWrapper<DataType>::Train(const DataSet& dataset, const Config& cfg) {
-    std::shared_ptr<const DataSet> ds_ptr = dataset.shared_from_this();
-    if constexpr (!std::is_same_v<DataType, typename MockData<DataType>::type>) {
-        ds_ptr = data_type_conversion<DataType, typename MockData<DataType>::type>(dataset);
-    }
-    return index_node_->Train(*ds_ptr, cfg);
+IndexNodeDataMockWrapper<DataType>::Train(const DataSetPtr dataset, std::shared_ptr<Config> cfg,
+                                          bool use_knowhere_build_pool) {
+    auto ds_ptr = ConvertFromDataTypeIfNeeded<DataType>(dataset);
+    return index_node_->Train(ds_ptr, std::move(cfg), use_knowhere_build_pool);
 }
 
 template <typename DataType>
 Status
-IndexNodeDataMockWrapper<DataType>::Add(const DataSet& dataset, const Config& cfg) {
-    std::shared_ptr<const DataSet> ds_ptr = dataset.shared_from_this();
-    if constexpr (!std::is_same_v<DataType, typename MockData<DataType>::type>) {
-        ds_ptr = data_type_conversion<DataType, typename MockData<DataType>::type>(dataset);
-    }
-    return index_node_->Add(*ds_ptr, cfg);
+IndexNodeDataMockWrapper<DataType>::Add(const DataSetPtr dataset, std::shared_ptr<Config> cfg,
+                                        bool use_knowhere_build_pool) {
+    auto ds_ptr = ConvertFromDataTypeIfNeeded<DataType>(dataset);
+    return index_node_->Add(ds_ptr, std::move(cfg), use_knowhere_build_pool);
+}
+
+template <typename DataType>
+Status
+IndexNodeDataMockWrapper<DataType>::AddEmbList(const DataSetPtr dataset, std::shared_ptr<Config> cfg,
+                                               const size_t* lims, size_t num_rows, bool use_knowhere_build_pool) {
+    auto ds_ptr = ConvertFromDataTypeIfNeeded<DataType>(dataset);
+    return index_node_->AddEmbList(ds_ptr, std::move(cfg), lims, num_rows, use_knowhere_build_pool);
 }
 
 template <typename DataType>
 expected<DataSetPtr>
-IndexNodeDataMockWrapper<DataType>::Search(const DataSet& dataset, const Config& cfg, const BitsetView& bitset) const {
-    auto ds_ptr = dataset.shared_from_this();
-    if constexpr (!std::is_same_v<DataType, typename MockData<DataType>::type>) {
-        ds_ptr = data_type_conversion<DataType, typename MockData<DataType>::type>(dataset);
-    }
-    return index_node_->Search(*ds_ptr, cfg, bitset);
+IndexNodeDataMockWrapper<DataType>::Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg,
+                                           const BitsetView& bitset, milvus::OpContext* op_context) const {
+    auto ds_ptr = ConvertFromDataTypeIfNeeded<DataType>(dataset);
+    return index_node_->Search(ds_ptr, std::move(cfg), bitset, op_context);
 }
 
 template <typename DataType>
 expected<DataSetPtr>
-IndexNodeDataMockWrapper<DataType>::RangeSearch(const DataSet& dataset, const Config& cfg,
-                                                const BitsetView& bitset) const {
-    auto ds_ptr = dataset.shared_from_this();
-    if constexpr (!std::is_same_v<DataType, typename MockData<DataType>::type>) {
-        ds_ptr = data_type_conversion<DataType, typename MockData<DataType>::type>(dataset);
-    }
-    return index_node_->RangeSearch(*ds_ptr, cfg, bitset);
+IndexNodeDataMockWrapper<DataType>::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg,
+                                                const BitsetView& bitset, milvus::OpContext* op_context) const {
+    auto ds_ptr = ConvertFromDataTypeIfNeeded<DataType>(dataset);
+    return index_node_->RangeSearch(ds_ptr, std::move(cfg), bitset, op_context);
 }
 
 template <typename DataType>
-expected<std::vector<std::shared_ptr<IndexNode::iterator>>>
-IndexNodeDataMockWrapper<DataType>::AnnIterator(const DataSet& dataset, const Config& cfg,
-                                                const BitsetView& bitset) const {
-    auto ds_ptr = dataset.shared_from_this();
-    if constexpr (!std::is_same_v<DataType, typename MockData<DataType>::type>) {
-        ds_ptr = data_type_conversion<DataType, typename MockData<DataType>::type>(dataset);
-    }
-    return index_node_->AnnIterator(*ds_ptr, cfg, bitset);
+expected<std::vector<IndexNode::IteratorPtr>>
+IndexNodeDataMockWrapper<DataType>::AnnIterator(const DataSetPtr dataset, std::unique_ptr<Config> cfg,
+                                                const BitsetView& bitset, bool use_knowhere_search_pool,
+                                                milvus::OpContext* op_context) const {
+    auto ds_ptr = ConvertFromDataTypeIfNeeded<DataType>(dataset);
+    return index_node_->AnnIterator(ds_ptr, std::move(cfg), bitset, use_knowhere_search_pool, op_context);
 }
 
 template <typename DataType>
 expected<DataSetPtr>
-IndexNodeDataMockWrapper<DataType>::GetVectorByIds(const DataSet& dataset) const {
-    auto res = index_node_->GetVectorByIds(dataset);
+IndexNodeDataMockWrapper<DataType>::GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const {
+    auto res = index_node_->GetVectorByIds(dataset, op_context);
     if constexpr (!std::is_same_v<DataType, typename MockData<DataType>::type>) {
         if (res.has_value()) {
             auto res_v = data_type_conversion<typename MockData<DataType>::type, DataType>(*res.value());
@@ -98,6 +93,17 @@ IndexNodeDataMockWrapper<DataType>::GetVectorByIds(const DataSet& dataset) const
     }
 }
 
+template <typename DataType>
+expected<DataSetPtr>
+IndexNodeDataMockWrapper<DataType>::CalcDistByStorageIds(const DataSetPtr dataset, const BitsetView& bitset,
+                                                         const int64_t* labels, const size_t labels_len,
+                                                         const bool is_cosine, milvus::OpContext* op_context) const {
+    auto ds_ptr = ConvertFromDataTypeIfNeeded<DataType>(dataset);
+    return index_node_->CalcDistByStorageIds(ds_ptr, bitset, labels, labels_len, is_cosine, op_context);
+}
+
 template class knowhere::IndexNodeDataMockWrapper<knowhere::fp16>;
 template class knowhere::IndexNodeDataMockWrapper<knowhere::bf16>;
+template class knowhere::IndexNodeDataMockWrapper<knowhere::int8>;
+
 }  // namespace knowhere

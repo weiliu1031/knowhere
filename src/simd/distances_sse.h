@@ -9,12 +9,16 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#ifndef DISTANCES_SSE_H
-#define DISTANCES_SSE_H
+#pragma once
 
 #include <cstdint>
 #include <cstdio>
+
+#include "knowhere/operands.h"
+
 namespace faiss {
+namespace cppcontrib {
+namespace knowhere {
 
 /// Squared L2 distance between two vectors
 float
@@ -47,12 +51,51 @@ fvec_madd_sse(size_t n, const float* a, float bf, const float* b, float* c);
 int
 fvec_madd_and_argmin_sse(size_t n, const float* a, float bf, const float* b, float* c);
 
+///////////////////////////////////////////////////////////////////////////////
+// for hnsw sq, obsolete
+
 int32_t
 ivec_inner_product_sse(const int8_t* x, const int8_t* y, size_t d);
 
 int32_t
 ivec_L2sqr_sse(const int8_t* x, const int8_t* y, size_t d);
 
-}  // namespace faiss
+///////////////////////////////////////////////////////////////////////////////
+// bf16
 
-#endif /* DISTANCES_SSE_H */
+float
+bf16_vec_inner_product_sse(const ::knowhere::bf16* x, const ::knowhere::bf16* y, size_t d);
+
+float
+bf16_vec_L2sqr_sse(const ::knowhere::bf16* x, const ::knowhere::bf16* y, size_t d);
+
+float
+bf16_vec_norm_L2sqr_sse(const ::knowhere::bf16* x, size_t d);
+
+///////////////////////////////////////////////////////////////////////////////
+// int8
+
+float
+int8_vec_inner_product_sse(const int8_t* x, const int8_t* y, size_t d);
+
+float
+int8_vec_L2sqr_sse(const int8_t* x, const int8_t* y, size_t d);
+
+float
+int8_vec_norm_L2sqr_sse(const int8_t* x, size_t d);
+
+///////////////////////////////////////////////////////////////////////////////
+// rabitq
+float
+fvec_masked_sum_sse(const float* q, const uint8_t* x, const size_t d);
+int
+rabitq_dp_popcnt_sse(const uint8_t* q, const uint8_t* x, const size_t d, const size_t nb);
+
+///////////////////////////////////////////////////////////////////////////////
+// minhash
+uint64_t
+calculate_hash_sse(const char* data, size_t size);
+
+}  // namespace knowhere
+}  // namespace cppcontrib
+}  // namespace faiss

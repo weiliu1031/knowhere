@@ -16,6 +16,7 @@ class CustomBuildPy(build_py):
     """Run build_ext before build_py to compile swig code."""
 
     def run(self):
+        # Verify that libknowhere exists but don't copy it
         so_src = os.path.join("..", "build", "Release", "libknowhere.so")
         dylib_src = os.path.join("..", "build", "Release", "libknowhere.dylib")
         if os.path.exists(so_src):
@@ -45,22 +46,36 @@ def get_readme():
 DEFINE_MACROS = [
     ("FINTEGER", "int"),
     ("SWIGWORDSIZE64", "1"),
+    ("GLOG_USE_GLOG_EXPORT", None),
 ]
 
 INCLUDE_DIRS = [
     get_numpy_include(),
     os.path.join("..", "include"),
     os.path.join("..", "thirdparty"),
+    get_thirdparty_prefix("milvus-common") + "/include",
+    get_thirdparty_prefix("boost-headers") + "/include",
     get_thirdparty_prefix("nlohmann_json") + "/include",
     get_thirdparty_prefix("libglog") + "/include",
-    get_thirdparty_prefix("gflags") + "/include"
+    get_thirdparty_prefix("gflags") + "/include",
+    get_thirdparty_prefix("libfolly") + "/include",
+    get_thirdparty_prefix("double-conversion") + "/include",
+    get_thirdparty_prefix("fmt") + "/include"
 ]
 
-LIBRARY_DIRS = [os.path.join("..", "build", "Release")]
-EXTRA_COMPILE_ARGS = ["-fPIC", "-std=gnu++17"]
+BUILD_DIR = os.path.abspath(os.path.join("..", "build", "Release"))
+MILVUS_COMMON_LIB_DIR = get_thirdparty_prefix("milvus-common") + "/lib"
+
+LIBRARY_DIRS = [
+    BUILD_DIR,
+    MILVUS_COMMON_LIB_DIR
+]
+EXTRA_COMPILE_ARGS = ["-fPIC", "-std=gnu++20"]
 EXTRA_LINK_ARGS = [
     "-lknowhere",
-    "-Wl,-rpath,$ORIGIN",
+    "-lmilvus-common",
+    f"-Wl,-rpath,{BUILD_DIR}",
+    f"-Wl,-rpath,{MILVUS_COMMON_LIB_DIR}",
 ]
 
 SWIG_OPTS = [
@@ -95,14 +110,23 @@ setup(
     author_email="milvus-team@zilliz.com",
     license='Apache License 2.0',
     keywords="search nearest neighbors",
-    setup_requires=["numpy", "setuptools_scm"],
+
+    # numpy must be pre-installed in the active Python environment. Standalone
+    # wheel builds use the uv-managed python/.venv from install_deps.sh; CI
+    # jobs such as cibuildwheel install numpy into their own active interpreter.
+    # Do NOT use setup_requires — it triggers the deprecated fetch_build_eggs
+    # which makes network calls to PyPI and fails intermittently in CI.
     #use_scm_version={'root': '..', 'local_scheme': 'no-local-version', 'version_scheme': 'release-branch-semver'},
     long_description=get_readme(),
     long_description_content_type="text/markdown",
     packages=["knowhere"],
     include_package_data=True,
     package_data={"knowhere": ["libknowhere.so"]},
-    python_requires=">=3.8",
+    python_requires=">=3.10",
+    install_requires=[
+        "numpy>=2,<3",
+        "ml-dtypes",
+    ],
     ext_modules=[_swigknowhere],
     cmdclass={"build_py": CustomBuildPy},
     classifiers=[
@@ -111,10 +135,11 @@ setup(
         "Intended Audience :: Science/Research",
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: POSIX",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
 )

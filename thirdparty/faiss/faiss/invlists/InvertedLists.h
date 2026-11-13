@@ -1,5 +1,5 @@
-/**
- * Copyright (c) Facebook, Inc. and its affiliates.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -15,38 +15,11 @@
  * the interface.
  */
 
-#include <atomic>
-#include <cassert>
-#include <deque>
-#include <memory>
-#include <set>
 #include <vector>
 
 #include <faiss/MetricType.h>
-
-namespace faiss {
-
-struct PageLockMemory {
-public:
-    PageLockMemory() : data(nullptr), nbytes(0) {}
-
-    PageLockMemory(size_t size);
-
-    ~PageLockMemory();
-
-    PageLockMemory(const PageLockMemory& other);
-
-    PageLockMemory(PageLockMemory &&other);
-
-    inline size_t size() {
-        return nbytes;
-    }
-
-    void *data;
-    size_t nbytes;
-};
-using PageLockMemoryPtr = std::shared_ptr<PageLockMemory>;
-}
+#include <faiss/impl/Panorama.h>
+#include <faiss/impl/maybe_owned_vector.h>
 
 namespace faiss {
 
@@ -55,6 +28,24 @@ struct InvertedListsIterator {
     virtual bool is_available() const = 0;
     virtual void next() = 0;
     virtual std::pair<idx_t, const uint8_t*> get_id_and_codes() = 0;
+
+    /// When true, iterate_codes will invoke on_distance_computed() and
+    /// on_heap_changed() via virtual dispatch. When false (the default),
+    /// iterate_codes skips the callbacks entirely — the guard branch is
+    /// perfectly predicted and costs ~0 cycles, so non-callback users
+    /// pay no overhead. Derived classes that override the callbacks
+    /// should set this to true in their constructor.
+    bool has_search_callbacks_ = false;
+
+    /// Called from iterate_codes after distance computation for the vector
+    /// returned by the most recent get_id_and_codes(). Default: no-op.
+    /// Only invoked when has_search_callbacks_ is true.
+    virtual void on_distance_computed(idx_t /* vid */, float /* distance */) {}
+
+    /// Called from iterate_codes when a vector replaces the current worst
+    /// in the top-K heap. evicted_id is the displaced entry. Default: no-op.
+    /// Only invoked when has_search_callbacks_ is true.
+    virtual void on_heap_changed(idx_t /* new_id */, idx_t /* evicted_id */) {}
 };
 
 /** Table of inverted lists
@@ -67,9 +58,11 @@ struct InvertedListsIterator {
 struct InvertedLists {
     size_t nlist;     ///< number of possible key values
     size_t code_size; ///< code size per vector in bytes
-    bool use_iterator;
 
-    InvertedLists(size_t nlist, size_t code_size);
+    /// request to use iterator rather than get_codes / get_ids
+    bool use_iterator = false;
+
+    InvertedLists(size_t nlist_, size_t code_size_);
 
     virtual ~InvertedLists();
 
@@ -80,25 +73,8 @@ struct InvertedLists {
     /*************************
      *  Read only functions */
 
-    // check if the list is empty
-    bool is_empty(size_t list_no, void* inverted_list_context) const;
-
     /// get the size of a list
     virtual size_t list_size(size_t list_no) const = 0;
-
-    // get the segment number of a list (continuous storage can be regarded as 1-segment storage)
-    virtual size_t get_segment_num(size_t list_no) const;
-
-    // get the size of a segment in the given list (continuous storage can be regarded as 1-segment storage)
-    virtual size_t get_segment_size(size_t list_no, size_t segment_no) const;
-
-    // get the segment minimal number of a list (continuous storage can be regarded as 1-segment storage)
-    virtual size_t get_segment_offset(size_t list_no, size_t segment_no) const;
-
-    /// get iterable for lists that use_iterator
-    virtual InvertedListsIterator* get_iterator(
-            size_t list_no,
-            void* inverted_list_context) const;
 
     /** get the codes for an inverted list
      * must be released by release_codes
@@ -114,31 +90,8 @@ struct InvertedLists {
      */
     virtual const idx_t* get_ids(size_t list_no) const = 0;
 
-    /** get the codes slice beginning with offset for an inverted list
-     *
-     * @return codes    size : user guarantee the slice side by list_size or segment_size API
-     */
-    virtual const uint8_t* get_codes(size_t list_no, size_t offset) const;
-
-    /**
-     * get the code normal lengths for an inverted list
-     * @param list_no
-     * @param offset
-     * @return
-     */
-    virtual const float* get_code_norms(size_t list_no, size_t offset) const;
-
-    /** get the ids slice beginning with offset for an inverted list
-     *
-     * @return ids      size : user guarantee the slice side by list_size or segment_size API
-     */
-    virtual const idx_t* get_ids(size_t list_no, size_t offset) const;
-
     /// release codes returned by get_codes (default implementation is nop
     virtual void release_codes(size_t list_no, const uint8_t* codes) const;
-
-    /// release code normals returned by get_code_norms (default implementation is nop
-    virtual void release_code_norms(size_t list_no, const float* codes) const;
 
     /// release ids returned by get_ids
     virtual void release_ids(size_t list_no, const idx_t* ids) const;
@@ -152,25 +105,35 @@ struct InvertedLists {
 
     /// prepare the following lists (default does nothing)
     /// a list can be -1 hence the signed long
-    virtual void prefetch_lists(const idx_t* list_nos, int nlist) const;
+    virtual void prefetch_lists(const idx_t* list_nos, int nlist_in) const;
+
+    /*****************************************
+     * Iterator interface (with context)     */
+
+    /// check if the list is empty
+    virtual bool is_empty(size_t list_no, void* inverted_list_context = nullptr)
+            const;
+
+    /// get iterable for lists that use_iterator
+    virtual InvertedListsIterator* get_iterator(
+            size_t list_no,
+            void* inverted_list_context = nullptr) const;
 
     /*************************
      * writing functions     */
 
     /// add one entry to an inverted list
     virtual size_t add_entry(
-            size_t list_no, 
-            idx_t theid, 
+            size_t list_no,
+            idx_t theid,
             const uint8_t* code,
-            const float* code_norm = nullptr,
             void* inverted_list_context = nullptr);
 
     virtual size_t add_entries(
             size_t list_no,
             size_t n_entry,
             const idx_t* ids,
-            const uint8_t* code,
-            const float* code_norm = nullptr) = 0;
+            const uint8_t* code) = 0;
 
     virtual void update_entry(
             size_t list_no,
@@ -188,10 +151,6 @@ struct InvertedLists {
     virtual void resize(size_t list_no, size_t new_size) = 0;
 
     virtual void reset();
-
-    virtual InvertedLists* to_readonly();
-
-    virtual bool is_readonly() const;
 
     /*************************
      * high level functions  */
@@ -262,11 +221,8 @@ struct InvertedLists {
         const idx_t* ids;
         size_t list_no;
 
-        ScopedIds(const InvertedLists* il, size_t list_no)
-                : il(il), ids(il->get_ids(list_no)), list_no(list_no) {}
-
-        ScopedIds(const InvertedLists* il, size_t list_no, size_t offset)
-                : il(il), ids(il->get_ids(list_no, offset)), list_no(list_no) {}
+        ScopedIds(const InvertedLists* il_, size_t list_no_)
+                : il(il_), ids(il_->get_ids(list_no_)), list_no(list_no_) {}
 
         const idx_t* get() {
             return ids;
@@ -286,20 +242,13 @@ struct InvertedLists {
         const uint8_t* codes;
         size_t list_no;
 
-        ScopedCodes(const InvertedLists* il, size_t list_no)
-                : il(il), codes(il->get_codes(list_no)), list_no(list_no) {}
+        ScopedCodes(const InvertedLists* il_, size_t list_no_)
+                : il(il_), codes(il_->get_codes(list_no_)), list_no(list_no_) {}
 
-        ScopedCodes(const InvertedLists* il, size_t list_no, size_t offset)
-                : il(il),
-                  codes(il->get_single_code(list_no, offset)),
-                  list_no(list_no) {}
-
-        // For codes outside
-        ScopedCodes(const InvertedLists *il, size_t list_no,
-                    const uint8_t *original_codes)
-                : il(il),
-                  codes(original_codes),
-                  list_no(list_no) {}
+        ScopedCodes(const InvertedLists* il_, size_t list_no_, size_t offset)
+                : il(il_),
+                  codes(il_->get_single_code(list_no_, offset)),
+                  list_no(list_no_) {}
 
         const uint8_t* get() {
             return codes;
@@ -309,54 +258,24 @@ struct InvertedLists {
             il->release_codes(list_no, codes);
         }
     };
-
-    struct ScopedCodeNorms {
-        const InvertedLists* il;
-        const float* code_norms;
-        size_t list_no;
-
-        ScopedCodeNorms(const InvertedLists* il, size_t list_no, size_t offset)
-                : il(il),
-                  code_norms(il->get_code_norms(list_no, offset)),
-                  list_no(list_no) {}
-
-        const float* get() {
-            return code_norms;
-        }
-
-        ~ScopedCodeNorms() {
-            il->release_code_norms(list_no, code_norms);
-        }
-    };
 };
 
 /// simple (default) implementation as an array of inverted lists
 struct ArrayInvertedLists : InvertedLists {
-    std::vector<std::vector<uint8_t>> codes; // binary codes, size nlist
-    std::vector<std::vector<idx_t>> ids;     ///< Inverted lists for indexes
+    std::vector<MaybeOwnedVector<uint8_t>> codes; // binary codes, size nlist
+    std::vector<MaybeOwnedVector<idx_t>> ids; ///< Inverted lists for indexes
 
-    bool with_norm = false;
-    std::vector<std::vector<float>> code_norms; // code norms
-
-    ArrayInvertedLists(size_t nlist, size_t code_size, bool with_norm = false);
+    ArrayInvertedLists(size_t nlist_in, size_t code_size_in);
 
     size_t list_size(size_t list_no) const override;
     const uint8_t* get_codes(size_t list_no) const override;
     const idx_t* get_ids(size_t list_no) const override;
 
-    void restore_codes(const uint8_t* raw_data,
-                       const size_t raw_size,
-                       const bool is_cosine);
-
-    const float* get_code_norms(size_t list_no, size_t offset) const override;
-    void release_code_norms(size_t list_no, const float* codes) const override;
-
     size_t add_entries(
             size_t list_no,
             size_t n_entry,
             const idx_t* ids,
-            const uint8_t* code,
-            const float* code_norm = nullptr) override;
+            const uint8_t* code) override;
 
     void update_entries(
             size_t list_no,
@@ -366,65 +285,37 @@ struct ArrayInvertedLists : InvertedLists {
             const uint8_t* code) override;
 
     void resize(size_t list_no, size_t new_size) override;
-
-    InvertedLists* to_readonly() override;
 
     /// permute the inverted lists, map maps new_id to old_id
     void permute_invlists(const idx_t* map);
 
+    bool is_empty(size_t list_no, void* inverted_list_context = nullptr)
+            const override;
+
     ~ArrayInvertedLists() override;
 };
 
-// A Concurrent implementation for inverted lists
-struct ConcurrentArrayInvertedLists : InvertedLists {
-    template <typename T>
-    struct Segment {
-        Segment(size_t segment_size, size_t code_size) : segment_size_(segment_size), code_size_(code_size) {
-            data_.reserve(segment_size_ * code_size_);
-        }
-        T& operator[](idx_t idx) {
-            assert(idx < segment_size_);
-            return data_[idx * code_size_];
-        }
-        const T& operator[](idx_t idx) const {
-            assert(idx < segment_size_);
-            return data_[idx * code_size_];
-        }
-        size_t segment_size_;
-        size_t code_size_;
-        std::vector<T> data_;
-    };
+/// Level-oriented storage as defined in the IVFFlat section of Panorama
+/// (https://www.arxiv.org/pdf/2510.00566).
+struct ArrayInvertedListsPanorama : ArrayInvertedLists {
+    std::vector<MaybeOwnedVector<float>> cum_sums;
+    const size_t n_levels;
+    const size_t level_width; // in code units
+    Panorama pano;
 
-    ConcurrentArrayInvertedLists(size_t nlist, size_t code_size, size_t segment_size, bool save_normal);
+    ArrayInvertedListsPanorama(
+            size_t nlist_in,
+            size_t code_size_in,
+            size_t n_levels_in,
+            size_t batch_size = Panorama::kDefaultBatchSize);
 
-    size_t cal_segment_num(size_t capacity) const;
-    void reserve(size_t list_no, size_t capacity);
-    void shrink_to_fit(size_t list_no, size_t capacity);
-
-    size_t list_size(size_t list_no) const override;
-    const uint8_t* get_codes(size_t list_no) const override;
-    const idx_t* get_ids(size_t list_no) const override;
-
-    size_t get_segment_num(size_t list_no) const override;
-    size_t get_segment_size(size_t list_no, size_t segment_no) const override;
-    size_t get_segment_offset(size_t list_no, size_t segment_no) const override;
-
-    const uint8_t* get_codes(size_t list_no, size_t offset) const override;
-    const idx_t* get_ids(size_t list_no, size_t offset) const override;
-
-    const float* get_code_norms(size_t list_no, size_t offset) const override;
-    void release_code_norms(size_t list_no, const float* codes)
-            const override;
-
-    idx_t get_single_id(size_t list_no, size_t offset) const override;
-    const uint8_t* get_single_code(size_t list_no, size_t offset) const override;
+    const float* get_cum_sums(size_t list_no) const;
 
     size_t add_entries(
             size_t list_no,
             size_t n_entry,
             const idx_t* ids,
-            const uint8_t* code,
-            const float* code_norms = nullptr) override;
+            const uint8_t* code) override;
 
     void update_entries(
             size_t list_no,
@@ -433,73 +324,23 @@ struct ConcurrentArrayInvertedLists : InvertedLists {
             const idx_t* ids,
             const uint8_t* code) override;
 
-    InvertedLists* to_readonly() override;
-
     void resize(size_t list_no, size_t new_size) override;
 
-    ~ConcurrentArrayInvertedLists() override;
-
-    size_t segment_size;
-    bool save_norm;
-    std::vector<std::atomic<size_t>> list_cur;
-    std::vector<std::deque<Segment<uint8_t>>> codes;
-    std::vector<std::deque<Segment<idx_t>>> ids;
-    std::vector<std::deque<Segment<float>>> code_norms;
-};
-
-struct ReadOnlyArrayInvertedLists: InvertedLists {
-    // for GPU
-    PageLockMemoryPtr pin_readonly_codes;
-    PageLockMemoryPtr pin_readonly_ids;
-
-    // for CPU
-    std::vector<uint8_t> readonly_codes;
-    std::vector<idx_t> readonly_ids;
-
-    std::vector<size_t> readonly_length;
-    std::vector<size_t> readonly_offset;
-    bool valid;
-
-    ReadOnlyArrayInvertedLists(
-            size_t nlist,
-            size_t code_size,
-            const std::vector<size_t>& list_length);
-
-    explicit ReadOnlyArrayInvertedLists(const ArrayInvertedLists& other);
-    explicit ReadOnlyArrayInvertedLists(const ArrayInvertedLists& other, bool offset);
-
-    // Use default copy construct, just copy pointer, DON'T COPY pin_readonly_codes AND pin_readonly_ids
-    // explicit ReadOnlyArrayInvertedLists(const ReadOnlyArrayInvertedLists &);
-    // explicit ReadOnlyArrayInvertedLists(ReadOnlyArrayInvertedLists &&);
-    virtual ~ReadOnlyArrayInvertedLists();
-
-    size_t list_size(size_t list_no) const override;
-    const uint8_t * get_codes(size_t list_no) const override;
-    const idx_t * get_ids(size_t list_no) const override;
-
-    const uint8_t * get_all_codes() const;
-    const idx_t * get_all_ids() const;
-    const std::vector<size_t>& get_list_length() const;
-
-    size_t add_entries(
+    /// Panorama's layout make it impractical to support iterators as defined
+    /// by Faiss (i.e. `InvertedListsIterator` API). The iterator would require
+    /// to allocate and reassemble the vector at each call.
+    /// Hence, we override this method to throw an error, this effectively
+    /// disables the `iterate_codes` and `iterate_codes_range` methods.
+    InvertedListsIterator* get_iterator(
             size_t list_no,
-            size_t n_entry,
-            const idx_t* ids,
-            const uint8_t* code,
-            const float* code_norm = nullptr) override;
+            void* inverted_list_context = nullptr) const override;
 
-    void update_entries(
-            size_t list_no,
-            size_t offset,
-            size_t n_entry,
-            const idx_t *ids,
-            const uint8_t *code) override;
+    /// Reconstructs a single code from level-oriented storage to flat format.
+    const uint8_t* get_single_code(size_t list_no, size_t offset)
+            const override;
 
-    void resize(size_t list_no, size_t new_size) override;
-
-    bool is_readonly() const override;
-
-    bool is_valid();
+    /// Frees codes returned by `get_single_code`.
+    void release_codes(size_t list_no, const uint8_t* codes_in) const override;
 };
 
 /*****************************************************************
@@ -511,15 +352,14 @@ struct ReadOnlyArrayInvertedLists: InvertedLists {
 
 /// invlists that fail for all write functions
 struct ReadOnlyInvertedLists : InvertedLists {
-    ReadOnlyInvertedLists(size_t nlist, size_t code_size)
-            : InvertedLists(nlist, code_size) {}
+    ReadOnlyInvertedLists(size_t nlist_, size_t code_size_)
+            : InvertedLists(nlist_, code_size_) {}
 
     size_t add_entries(
             size_t list_no,
             size_t n_entry,
             const idx_t* ids,
-            const uint8_t* code,
-            const float* code_norm = nullptr) override;
+            const uint8_t* code) override;
 
     void update_entries(
             size_t list_no,
@@ -536,13 +376,13 @@ struct HStackInvertedLists : ReadOnlyInvertedLists {
     std::vector<const InvertedLists*> ils;
 
     /// build InvertedLists by concatenating nil of them
-    HStackInvertedLists(int nil, const InvertedLists** ils);
+    HStackInvertedLists(int n_il, const InvertedLists** ils);
 
     size_t list_size(size_t list_no) const override;
     const uint8_t* get_codes(size_t list_no) const override;
     const idx_t* get_ids(size_t list_no) const override;
 
-    void prefetch_lists(const idx_t* list_nos, int nlist) const override;
+    void prefetch_lists(const idx_t* list_nos, int nlist_in) const override;
 
     void release_codes(size_t list_no, const uint8_t* codes) const override;
     void release_ids(size_t list_no, const idx_t* ids) const override;
@@ -560,7 +400,7 @@ struct SliceInvertedLists : ReadOnlyInvertedLists {
     const InvertedLists* il;
     idx_t i0, i1;
 
-    SliceInvertedLists(const InvertedLists* il, idx_t i0, idx_t i1);
+    SliceInvertedLists(const InvertedLists* il_, idx_t i0_, idx_t i1_);
 
     size_t list_size(size_t list_no) const override;
     const uint8_t* get_codes(size_t list_no) const override;
@@ -574,7 +414,7 @@ struct SliceInvertedLists : ReadOnlyInvertedLists {
     const uint8_t* get_single_code(size_t list_no, size_t offset)
             const override;
 
-    void prefetch_lists(const idx_t* list_nos, int nlist) const override;
+    void prefetch_lists(const idx_t* list_nos, int nlist_in) const override;
 };
 
 struct VStackInvertedLists : ReadOnlyInvertedLists {
@@ -582,7 +422,7 @@ struct VStackInvertedLists : ReadOnlyInvertedLists {
     std::vector<idx_t> cumsz;
 
     /// build InvertedLists by concatenating nil of them
-    VStackInvertedLists(int nil, const InvertedLists** ils);
+    VStackInvertedLists(int n_il, const InvertedLists** ils);
 
     size_t list_size(size_t list_no) const override;
     const uint8_t* get_codes(size_t list_no) const override;
@@ -596,7 +436,7 @@ struct VStackInvertedLists : ReadOnlyInvertedLists {
     const uint8_t* get_single_code(size_t list_no, size_t offset)
             const override;
 
-    void prefetch_lists(const idx_t* list_nos, int nlist) const override;
+    void prefetch_lists(const idx_t* list_nos, int nlist_in) const override;
 };
 
 /** use the first inverted lists if they are non-empty otherwise use the second
@@ -608,7 +448,9 @@ struct MaskedInvertedLists : ReadOnlyInvertedLists {
     const InvertedLists* il0;
     const InvertedLists* il1;
 
-    MaskedInvertedLists(const InvertedLists* il0, const InvertedLists* il1);
+    MaskedInvertedLists(
+            const InvertedLists* il0_in,
+            const InvertedLists* il1_in);
 
     size_t list_size(size_t list_no) const override;
     const uint8_t* get_codes(size_t list_no) const override;
@@ -622,7 +464,7 @@ struct MaskedInvertedLists : ReadOnlyInvertedLists {
     const uint8_t* get_single_code(size_t list_no, size_t offset)
             const override;
 
-    void prefetch_lists(const idx_t* list_nos, int nlist) const override;
+    void prefetch_lists(const idx_t* list_nos, int nlist_in) const override;
 };
 
 /** if the inverted list in il is smaller than maxsize then return it,
@@ -631,7 +473,7 @@ struct StopWordsInvertedLists : ReadOnlyInvertedLists {
     const InvertedLists* il0;
     size_t maxsize;
 
-    StopWordsInvertedLists(const InvertedLists* il, size_t maxsize);
+    StopWordsInvertedLists(const InvertedLists* il0_in, size_t maxsize_in);
 
     size_t list_size(size_t list_no) const override;
     const uint8_t* get_codes(size_t list_no) const override;
@@ -645,7 +487,47 @@ struct StopWordsInvertedLists : ReadOnlyInvertedLists {
     const uint8_t* get_single_code(size_t list_no, size_t offset)
             const override;
 
+    void prefetch_lists(const idx_t* list_nos, int nlist_in) const override;
+};
+
+/** Cap list sizes to maxsize for searching, while allowing writes.
+ *  Unlike StopWordsInvertedLists which skips large lists entirely,
+ *  this caps each list to maxsize entries (partial scan). */
+struct CappedInvertedLists : InvertedLists {
+    InvertedLists* il0;
+    size_t maxsize;
+
+    CappedInvertedLists(InvertedLists* il, size_t maxsize);
+
+    size_t list_size(size_t list_no) const override;
+    size_t real_list_size(size_t list_no) const;
+
+    const uint8_t* get_codes(size_t list_no) const override;
+    const idx_t* get_ids(size_t list_no) const override;
+
+    void release_codes(size_t list_no, const uint8_t* codes) const override;
+    void release_ids(size_t list_no, const idx_t* ids) const override;
+
+    idx_t get_single_id(size_t list_no, size_t offset) const override;
+    const uint8_t* get_single_code(size_t list_no, size_t offset)
+            const override;
+
     void prefetch_lists(const idx_t* list_nos, int nlist) const override;
+
+    size_t add_entries(
+            size_t list_no,
+            size_t n_entry,
+            const idx_t* ids,
+            const uint8_t* code) override;
+
+    void update_entries(
+            size_t list_no,
+            size_t offset,
+            size_t n_entry,
+            const idx_t* ids,
+            const uint8_t* code) override;
+
+    void resize(size_t list_no, size_t new_size) override;
 };
 
 } // namespace faiss

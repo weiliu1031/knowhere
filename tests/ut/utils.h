@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -39,20 +41,9 @@ struct DisPairLess {
 inline knowhere::DataSetPtr
 GenDataSet(int rows, int dim, int seed = 42) {
     std::mt19937 rng(seed);
-    std::uniform_int_distribution<> distrib(0.0, 100.0);
-    float* ts = new float[rows * dim];
-    for (int i = 0; i < rows * dim; ++i) ts[i] = (float)distrib(rng);
-    auto ds = knowhere::GenDataSet(rows, dim, ts);
-    ds->SetIsOwner(true);
-    return ds;
-}
-
-inline knowhere::DataSetPtr
-GenFloatDataSet(int rows, int dim, int seed = 42) {
-    std::mt19937 rng(seed);
     std::uniform_real_distribution<> distrib(0.0, 100.0);
     float* ts = new float[rows * dim];
-    for (int i = 0; i < rows * dim; ++i) ts[i] = (float)distrib(rng);
+    for (int i = 0; i < rows * dim; ++i) ts[i] = distrib(rng);
     auto ds = knowhere::GenDataSet(rows, dim, ts);
     ds->SetIsOwner(true);
     return ds;
@@ -76,8 +67,9 @@ GenBinDataSet(int rows, int dim, int seed = 42) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<> distrib(0.0, 100.0);
     int uint8_num = dim / 8;
-    uint8_t* ts = new uint8_t[rows * uint8_num];
-    for (int i = 0; i < rows * uint8_num; ++i) ts[i] = (uint8_t)distrib(rng);
+    uint64_t total_size = rows * uint8_num;
+    uint8_t* ts = new uint8_t[total_size];
+    for (uint64_t i = 0; i < total_size; ++i) ts[i] = (uint8_t)distrib(rng);
     auto ds = knowhere::GenDataSet(rows, dim, ts);
     ds->SetIsOwner(true);
     return ds;
@@ -129,7 +121,6 @@ GetKNNRecall(const knowhere::DataSet& ground_truth, const knowhere::DataSet& res
     for (auto i = 0; i < nq; ++i) {
         std::vector<int64_t> ids_0(gt_ids + i * gt_k, gt_ids + i * gt_k + res_k);
         std::vector<int64_t> ids_1(res_ids + i * res_k, res_ids + i * res_k + res_k);
-
         std::sort(ids_0.begin(), ids_0.end());
         std::sort(ids_1.begin(), ids_1.end());
 
@@ -143,14 +134,14 @@ GetKNNRecall(const knowhere::DataSet& ground_truth, const knowhere::DataSet& res
 }
 
 inline float
-GetKNNRecall(const knowhere::DataSet& ground_truth, const std::vector<std::vector<int64_t>>& result) {
+GetKNNRecall(const knowhere::DataSet& ground_truth, const std::vector<std::vector<int64_t>>& result, size_t topk = 0) {
     auto nq = result.size();
     auto gt_k = ground_truth.GetDim();
     auto gt_ids = ground_truth.GetIds();
-
+    auto topk_actual = topk == 0 ? gt_k : topk;
     uint32_t matched_num = 0;
-    for (auto i = 0; i < nq; ++i) {
-        std::vector<int64_t> ids_0(gt_ids + i * gt_k, gt_ids + i * gt_k + gt_k);
+    for (size_t i = 0; i < nq; ++i) {
+        std::vector<int64_t> ids_0(gt_ids + i * gt_k, gt_ids + i * gt_k + topk_actual);
         std::vector<int64_t> ids_1 = result[i];
 
         std::sort(ids_0.begin(), ids_0.end());
@@ -162,13 +153,13 @@ GetKNNRecall(const knowhere::DataSet& ground_truth, const std::vector<std::vecto
         v.resize(it - v.begin());
         matched_num += v.size();
     }
-    return ((float)matched_num) / ((float)nq * gt_k);
+    return static_cast<float>(matched_num) / (static_cast<float>(nq) * topk_actual);
 }
 
 //  Compare two ann-search results
 //      "ground_truth" here is just used as a baseline value for comparison. It is not real groundtruth and the knn
 //  results may be worse, we can call the compare results as "relative-recall".
-//      when the k-th distance of gt is worth, define the recall as 1.0f
+//      when the k-th distance of gt is worse, define the recall as 1.0f
 //      when the k-th distance of gt is better, define the recall as (intersection_count / size)
 inline float
 GetKNNRelativeRecall(const knowhere::DataSet& ground_truth, const knowhere::DataSet& result, bool dist_less_better) {
@@ -226,6 +217,12 @@ GetRangeSearchRecall(const knowhere::DataSet& gt, const knowhere::DataSet& resul
     auto res_lims_p = result.GetLims();
     auto gt_ids_p = gt.GetIds();
     auto gt_lims_p = gt.GetLims();
+
+    // check if both gt and result are empty
+    if (gt_lims_p[nq] == 0 && res_lims_p[nq] == 0) {
+        return 1;
+    }
+
     uint32_t ninter = 0;
     for (uint32_t i = 0; i < nq; ++i) {
         std::set<int64_t> inter;
@@ -242,9 +239,39 @@ GetRangeSearchRecall(const knowhere::DataSet& gt, const knowhere::DataSet& resul
     return (1 + precision) * recall / 2;
 }
 
+inline float
+GetRelativeLoss(float gt_res, float res) {
+    if (gt_res == 0.0 || std::abs(gt_res) < 0.000001) {
+        return gt_res;
+    }
+    return std::abs((gt_res - res) / gt_res);
+}
+
+template <typename DataType>
+void
+WriteRawDataToDisk(const std::string data_path, const DataType* raw_data, const uint32_t num, const uint32_t dim) {
+    std::ofstream writer(data_path.c_str(), std::ios::binary);
+    writer.write((char*)&num, sizeof(uint32_t));
+    writer.write((char*)&dim, sizeof(uint32_t));
+    uint64_t size = sizeof(DataType) * num * dim;
+    if constexpr (std::is_same_v<DataType, knowhere::bin1>) {
+        size = num * dim / 8.0;
+    }
+    writer.write((char*)raw_data, size);
+    writer.close();
+}
+
+inline void
+WriteEmbListOffsetToDisk(const std::string data_path, const size_t* lims, const size_t num) {
+    std::ofstream writer(data_path.c_str(), std::ios::binary);
+    writer.write((char*)&num, sizeof(size_t));
+    writer.write((char*)lims, num * sizeof(size_t));
+    writer.close();
+}
+
 inline bool
 CheckDistanceInScope(const knowhere::DataSet& result, int topk, float low_bound, float high_bound) {
-    auto ids = result.GetDistance();
+    auto ids = result.GetIds();
     auto distances = result.GetDistance();
     auto rows = result.GetRows();
     for (int i = 0; i < rows; ++i) {
@@ -262,7 +289,7 @@ CheckDistanceInScope(const knowhere::DataSet& result, int topk, float low_bound,
 
 inline bool
 CheckDistanceInScope(const knowhere::DataSet& result, float low_bound, float high_bound) {
-    auto ids = result.GetDistance();
+    auto ids = result.GetIds();
     auto distances = result.GetDistance();
     auto lims = result.GetLims();
     auto rows = result.GetRows();
@@ -276,6 +303,77 @@ CheckDistanceInScope(const knowhere::DataSet& result, float low_bound, float hig
         }
     }
     return true;
+}
+
+inline std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
+GenerateScalarInfo(size_t n, size_t partition_num = 2) {
+    std::vector<std::vector<uint32_t>> scalar_info;
+    scalar_info.reserve(partition_num);
+    for (size_t i = 0; i < partition_num; ++i) {
+        std::vector<uint32_t> scalar;
+        scalar.reserve(n / partition_num + 1);
+        for (size_t j = 0; j < n; ++j) {
+            if (j % partition_num == i) {
+                scalar.emplace_back(j);
+            }
+        }
+        scalar_info.emplace_back(std::move(scalar));
+    }
+    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>> scalar_map;
+    scalar_map[0] = std::move(scalar_info);
+    return scalar_map;
+}
+
+inline std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>>
+GenerateScalarInfoWithStep(size_t n, size_t partition_num = 2, size_t step = 10) {
+    assert(step * partition_num <= n);
+    std::vector<std::vector<uint32_t>> scalar_info;
+    scalar_info.reserve(partition_num);
+    for (size_t i = 0; i < partition_num; ++i) {
+        std::vector<uint32_t> scalar;
+        scalar_info.emplace_back(std::move(scalar));
+    }
+    for (size_t i = 0; i < n; i += 1) {
+        size_t j = i / step;
+        scalar_info[j % partition_num].emplace_back(i);
+    }
+    std::unordered_map<int64_t, std::vector<std::vector<uint32_t>>> scalar_map;
+    scalar_map[0] = std::move(scalar_info);
+    return scalar_map;
+}
+
+inline std::vector<uint8_t>
+GenerateBitsetByScalarInfoAndFirstTBits(const std::vector<uint32_t>& scalar, size_t n, size_t t) {
+    assert(scalar.size() <= n);
+    assert(t >= 0 && t <= n - scalar.size());
+    // initialize all bits to 1 (set the unrelevant partition data to 1)
+    std::vector<uint8_t> data((n + 8 - 1) / 8, 0xff);
+    // set the scalar data to 0 first
+    if (scalar.size() > t) {
+        // reset the [t, scalar.size()) bits to 0
+        for (size_t i = t; i < scalar.size(); ++i) {
+            data[scalar[i] >> 3] &= ~(0x1 << (scalar[i] & 0x7));
+        }
+    }
+    return data;
+}
+
+inline std::vector<uint8_t>
+GenerateBitsetByPartition(size_t n, float pass_rate, size_t partition_num) {
+    float acc = 0.0f;
+    std::vector<uint8_t> data((n + 7) / 8, 0xff);
+    for (size_t i = 0; i < n; i += partition_num) {
+        acc += pass_rate;
+        if (acc >= 1.0f) {
+            acc -= 1.0f;
+            data[i >> 3] &= ~(0x1 << (i & 0x7));
+        }
+    }
+    if (n % 8 != 0) {
+        uint8_t mask = (1u << (n % 8)) - 1;
+        data[data.size() - 1] &= mask;
+    }
+    return data;
 }
 
 // Return a n-bits bitset data with first t bits set to true
@@ -321,7 +419,35 @@ GenerateRandomDistanceIdPair(size_t n) {
 
 inline auto
 GenTestVersionList() {
-    return GENERATE(as<int32_t>{}, knowhere::Version::GetCurrentVersion().VersionNumber());
+    return GENERATE(as<int32_t>{}, knowhere::Version::GetMaximumVersion().VersionNumber());
+}
+
+inline auto
+GenTestEmbListVersionList() {
+    return GENERATE(as<int32_t>{}, knowhere::Version::GetMaximumVersion().VersionNumber());
+}
+
+inline knowhere::DataSetPtr
+GenSparseDataSet(const std::vector<std::map<int32_t, float>>& data, int32_t cols) {
+    int32_t rows = data.size();
+    auto tensor = std::make_unique<knowhere::sparse::SparseRow<float>[]>(rows);
+
+    for (int32_t i = 0; i < rows; ++i) {
+        if (data[i].size() == 0) {
+            continue;
+        }
+        knowhere::sparse::SparseRow<float> row(data[i].size());
+        size_t j = 0;
+        for (auto& [idx, val] : data[i]) {
+            row.set_at(j++, idx, val);
+        }
+        tensor[i] = std::move(row);
+    }
+
+    auto ds = knowhere::GenDataSet(rows, cols, tensor.release());
+    ds->SetIsOwner(true);
+    ds->SetIsSparse(true);
+    return ds;
 }
 
 // Generate a sparse dataset with given sparsity.
@@ -349,22 +475,319 @@ GenSparseDataSet(int32_t rows, int32_t cols, float sparsity, int seed = 42) {
         data[row][col] = val;
     }
 
-    auto tensor = std::make_unique<knowhere::sparse::SparseRow<float>[]>(rows);
+    return GenSparseDataSet(data, cols);
+}
 
-    for (int32_t i = 0; i < rows; ++i) {
-        if (data[i].size() == 0) {
-            continue;
+// Generate a sparse dataset with given sparsity and max value.
+inline knowhere::DataSetPtr
+GenSparseDataSetWithMaxVal(int32_t rows, int32_t cols, float sparsity, float max_val, bool use_bm25 = false,
+                           int seed = 42) {
+    int32_t num_elements = static_cast<int32_t>(rows * cols * (1.0f - sparsity));
+
+    std::mt19937 rng(seed);
+    auto real_distrib = std::uniform_real_distribution<float>(0, max_val);
+    auto row_distrib = std::uniform_int_distribution<int32_t>(0, rows - 1);
+    auto col_distrib = std::uniform_int_distribution<int32_t>(0, cols - 1);
+
+    std::vector<std::map<int32_t, float>> data(rows);
+
+    for (int32_t i = 0; i < num_elements; ++i) {
+        auto row = row_distrib(rng);
+        while (data[row].size() == (size_t)cols) {
+            row = row_distrib(rng);
         }
-        knowhere::sparse::SparseRow<float> row(data[i].size());
-        size_t j = 0;
-        for (auto& [idx, val] : data[i]) {
-            row.set_at(j++, idx, val);
+        auto col = col_distrib(rng);
+        while (data[row].find(col) != data[row].end()) {
+            col = col_distrib(rng);
         }
-        tensor[i] = std::move(row);
+        auto val = use_bm25 ? static_cast<float>(static_cast<int32_t>(real_distrib(rng))) : real_distrib(rng);
+        data[row][col] = val;
     }
 
-    auto ds = knowhere::GenDataSet(rows, cols, tensor.release());
+    return GenSparseDataSet(data, cols);
+}
+
+// a timer
+struct StopWatch {
+    using timepoint_t = std::chrono::time_point<std::chrono::steady_clock>;
+
+    timepoint_t Start;
+
+    //
+    StopWatch() {
+        Start = std::chrono::steady_clock::now();
+    }
+
+    //
+    double
+    elapsed() const {
+        const auto now = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = now - Start;
+        return elapsed.count();
+    }
+};
+
+inline knowhere::DataSetPtr
+GenEmbListDataSet(int rows, int dim, const uint64_t seed = 42, int each_el_len = 10) {
+    std::mt19937 rng(seed);
+    // use int type to cover test cases for fb16, bf16, int8
+    std::uniform_int_distribution<> distrib(-100.0, 100.0);
+    float* ts = new float[rows * dim];
+    for (int i = 0; i < rows * dim; ++i) {
+        ts[i] = (float)distrib(rng);
+    }
+    auto ds = knowhere::GenDataSet(rows, dim, ts);
+    auto ptr = std::make_unique<size_t[]>(size_t(rows / each_el_len) + 2);
+    size_t i = 0;
+    for (; i * each_el_len < (size_t)rows; i += 1) {
+        ptr[i] = i * each_el_len;
+    }
+    ptr[i] = (size_t)rows;
+    const size_t* ptr_const = ptr.release();
+    ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
     ds->SetIsOwner(true);
-    ds->SetIsSparse(true);
     return ds;
+}
+
+inline knowhere::DataSetPtr
+GenChunkDataSet(int rows, int dim, const uint64_t seed = 42, int each_el_len = 10) {
+    std::mt19937 rng(seed);
+    // use int type to cover test cases for fb16, bf16, int8
+    std::uniform_int_distribution<> distrib(-100.0, 100.0);
+    size_t num_chunk = (rows + each_el_len - 1) / each_el_len;
+    float** chunk_ts = new float*[num_chunk];
+    size_t* lims = new size_t[num_chunk + 1];
+
+    for (size_t chunk_idx = 0; chunk_idx < num_chunk; chunk_idx += 1) {
+        lims[chunk_idx] = chunk_idx * each_el_len;
+        chunk_ts[chunk_idx] = new float[each_el_len * dim];
+        for (size_t i = 0; i < each_el_len * dim; i += 1) {
+            chunk_ts[chunk_idx][i] = (float)distrib(rng);
+        }
+    }
+    lims[num_chunk] = rows;
+
+    auto ds = knowhere::GenDataSet(rows, dim, chunk_ts);
+    ds->SetNumChunk(num_chunk);
+    ds->Set(knowhere::meta::EMB_LIST_OFFSET, (const size_t*)lims);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(num_chunk));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(num_chunk));
+    ds->SetIsChunk(true);
+    ds->SetIsOwner(true);
+    return ds;
+}
+
+inline knowhere::DataSetPtr
+GenChunkBinDataSet(int rows, int dim, const uint64_t seed = 42, int each_el_len = 10) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<> distrib(0.0, 100.0);
+    int uint8_dim = dim / 8;
+
+    size_t num_chunk = (rows + each_el_len - 1) / each_el_len;
+    uint8_t** chunk_ts = new uint8_t*[num_chunk];
+    size_t* lims = new size_t[num_chunk + 1];
+
+    for (size_t chunk_idx = 0; chunk_idx < num_chunk; chunk_idx += 1) {
+        lims[chunk_idx] = chunk_idx * each_el_len;
+        chunk_ts[chunk_idx] = new uint8_t[each_el_len * uint8_dim];
+        for (size_t i = 0; i < each_el_len * uint8_dim; i += 1) {
+            chunk_ts[chunk_idx][i] = (uint8_t)distrib(rng);
+        }
+    }
+    lims[num_chunk] = rows;
+
+    auto ds = knowhere::GenDataSet(rows, dim, chunk_ts);
+    ds->SetNumChunk(num_chunk);
+    ds->Set(knowhere::meta::EMB_LIST_OFFSET, (const size_t*)lims);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(num_chunk));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(num_chunk));
+    ds->SetIsChunk(true);
+    ds->SetIsOwner(true);
+    return ds;
+}
+
+inline knowhere::DataSetPtr
+GenEmbListDataSetWithSomeEmpty(int rows, int dim, const uint64_t seed = 42, int each_el_len = 10) {
+    std::mt19937 rng(seed);
+    // use int type to cover test cases for fb16, bf16, int8
+    std::uniform_int_distribution<> distrib(-100.0, 100.0);
+    float* ts = new float[rows * dim];
+    for (int i = 0; i < rows * dim; ++i) {
+        ts[i] = (float)distrib(rng);
+    }
+    auto ds = knowhere::GenDataSet(rows, dim, ts);
+    auto ptr = std::make_unique<size_t[]>(size_t(rows / each_el_len) + 2);
+    size_t i = 0;
+    for (; i * each_el_len < (size_t)rows; i += 1) {
+        if (i % 2 == 1) {
+            // make some empty emb lists, like [0, 0, 20, 20, 40, 40, ...]
+            ptr[i] = ptr[i - 1];
+        } else {
+            ptr[i] = i * each_el_len;
+        }
+    }
+    ptr[i] = (size_t)rows;
+    const size_t* ptr_const = ptr.release();
+    ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
+    ds->SetIsOwner(true);
+    return ds;
+}
+
+template <typename DataType>
+std::vector<knowhere::DataSetPtr>
+SplitEmbListDataSet(const knowhere::DataSetPtr ds, size_t partition_num, int each_el_len = 10) {
+    auto data = ds->GetTensor();
+    auto rows = ds->GetRows();
+    auto dim = ds->GetDim();
+    auto ptr = ds->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET);
+    auto num_el = (rows + each_el_len - 1) / each_el_len;
+
+    auto res = std::vector<knowhere::DataSetPtr>(partition_num);
+    auto each_part_el = num_el / partition_num;
+    for (size_t i = 0; i < partition_num; i++) {
+        auto start_el = i * each_part_el;
+        auto end_el = start_el + each_part_el;
+        if (i == partition_num - 1) {
+            end_el = num_el;
+        }
+        auto cur_rows = (end_el - start_el) * each_el_len;
+        auto ds = knowhere::GenDataSet(cur_rows, dim, (const DataType*)data + start_el * each_el_len * dim);
+        const size_t* ptr_const = ptr + start_el;
+        ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+        ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(end_el - start_el));
+        ds->Set(knowhere::meta::NQ, static_cast<int64_t>(end_el - start_el));
+        ds->SetIsOwner(false);
+        res[i] = std::move(ds);
+    }
+    return res;
+}
+
+inline knowhere::DataSetPtr
+GenEmbListBinDataSet(int rows, int dim, int seed = 42, int each_el_len = 10) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<> distrib(0.0, 100.0);
+    int uint8_dim = dim / 8;
+    uint64_t total_size = rows * uint8_dim;
+    uint8_t* ts = new uint8_t[total_size];
+    for (uint64_t i = 0; i < total_size; ++i) ts[i] = (uint8_t)distrib(rng);
+    auto ds = knowhere::GenDataSet(rows, dim, ts);
+    auto ptr = std::make_unique<size_t[]>(size_t(rows / each_el_len) + 2);
+    size_t i = 0;
+    for (; i * each_el_len < (size_t)rows; i += 1) {
+        ptr[i] = i * each_el_len;
+    }
+    ptr[i] = (size_t)rows;
+    const size_t* ptr_const = ptr.release();
+    ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
+    ds->SetIsOwner(true);
+    return ds;
+}
+
+inline knowhere::DataSetPtr
+GenQueryEmbListDataSet(int rows, int dim, const uint64_t seed = 42) {
+    std::mt19937 rng(seed);
+    // use int type to cover test cases for fb16, bf16, int8
+    std::uniform_int_distribution<> distrib(-100.0, 100.0);
+    float* ts = new float[rows * dim];
+    for (int i = 0; i < rows * dim; ++i) {
+        ts[i] = (float)distrib(rng);
+    }
+    auto ds = knowhere::GenDataSet(rows, dim, ts);
+    auto ptr = std::make_unique<size_t[]>(int(sqrt(rows)) + 2);
+    size_t i = 0;
+    while (true) {
+        if (i * i >= (size_t)rows) {
+            break;
+        }
+        ptr[i] = i * i;
+        i += 1;
+    }
+    ptr[i] = (size_t)rows;
+    const size_t* ptr_const = ptr.release();
+    ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
+    ds->SetIsOwner(true);
+    return ds;
+}
+
+inline knowhere::DataSetPtr
+GenQueryEmbListBinDataSet(int rows, int dim, const uint64_t seed = 42) {
+    std::mt19937 rng(seed);
+    // use int type to cover test cases for fb16, bf16, int8
+    std::uniform_int_distribution<> distrib(0.0, 100.0);
+    int uint8_dim = dim / 8;
+    uint64_t total_size = rows * uint8_dim;
+    uint8_t* ts = new uint8_t[total_size];
+    for (int i = 0; i < rows * uint8_dim; ++i) {
+        ts[i] = (uint8_t)distrib(rng);
+    }
+    auto ds = knowhere::GenDataSet(rows, dim, ts);
+    auto ptr = std::make_unique<size_t[]>(int(sqrt(rows)) + 2);
+    size_t i = 0;
+    while (true) {
+        if (i * i >= (size_t)rows) {
+            break;
+        }
+        ptr[i] = i * i;
+        i += 1;
+    }
+    ptr[i] = (size_t)rows;
+    const size_t* ptr_const = ptr.release();
+    ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
+    ds->SetIsOwner(true);
+    return ds;
+}
+
+inline std::vector<size_t>
+GenEmbListOffset(size_t rows, size_t each_el_len = 10) {
+    size_t num_el = (rows + each_el_len - 1) / each_el_len;
+    std::vector<size_t> lims(num_el + 1);
+    for (size_t i = 0; i < num_el; i += 1) {
+        lims[i] = i * each_el_len;
+    }
+    lims[num_el] = rows;
+    return lims;
+}
+
+template <typename T>
+void
+GenRandomSlice(const T* inputdata, size_t num_points, size_t dim, double ratio, std::unique_ptr<float[]>& sampled_data,
+               size_t& sample_size) {
+    std::vector<std::vector<float>> sampled_vecs;
+    const T* current_vector;
+
+    ratio = ratio < 1 ? ratio : 1;
+
+    std::random_device random_device;
+    size_t x = random_device();
+    std::mt19937 generator(x);
+    std::uniform_real_distribution<float> distribution(0, 1);
+
+    for (size_t i = 0; i < num_points; i++) {
+        current_vector = inputdata + dim * i;
+        float rnd_val = distribution(generator);
+        if (rnd_val < ratio) {
+            std::vector<float> cur_vector_float;
+            for (size_t d = 0; d < dim; d++) {
+                cur_vector_float.push_back((float)current_vector[d]);
+            }
+            sampled_vecs.push_back(cur_vector_float);
+        }
+    }
+    sample_size = sampled_vecs.size();
+    sampled_data = std::make_unique<float[]>(sample_size * dim);
+    for (size_t i = 0; i < sample_size; i++) {
+        for (size_t j = 0; j < dim; j++) {
+            sampled_data[i * dim + j] = (float)sampled_vecs[i][j];
+        }
+    }
 }

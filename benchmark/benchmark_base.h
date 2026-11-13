@@ -14,12 +14,15 @@
 #include <math.h>
 #include <sys/time.h>
 
+#include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
-#define CALC_TIME_SPAN(X)       \
-    double t_start = elapsed(); \
-    X;                          \
-    double t_diff = elapsed() - t_start;
+#define CALC_TIME_SPAN(X) \
+    T1_ = elapsed();      \
+    X;                    \
+    TDIFF_ = elapsed() - T1_;
 
 class Benchmark_base {
  public:
@@ -39,7 +42,7 @@ class Benchmark_base {
         }
     }
 
-    inline double
+    static inline double
     elapsed() {
         struct timeval tv;
         gettimeofday(&tv, nullptr);
@@ -86,7 +89,7 @@ class Benchmark_base {
         return (hit * 1.0f / (nq * min_k));
     }
 
-    float
+    static float
     CalcRecall(const int64_t* g_ids, const int64_t* ids, int32_t nq, int32_t k) {
         int32_t hit = 0;
         for (int32_t i = 0; i < nq; i++) {
@@ -208,7 +211,7 @@ class Benchmark_base {
     }
 
  protected:
-    double T0_;
+    double T0_, T1_, TDIFF_;
     std::string metric_type_;
     int32_t dim_;
     void* xb_ = nullptr;

@@ -1,8 +1,9 @@
-int total_timeout_minutes = 240
+int total_timeout_minutes = 120
 def knowhere_wheel=''
 pipeline {
     agent {
         kubernetes {
+            cloud "new_ci_idc"
             inheritFrom 'default'
             yamlFile 'ci/pod/e2e-gpu.yaml'
             defaultContainer 'main'
@@ -25,21 +26,16 @@ pipeline {
                         def date = sh(returnStdout: true, script: 'date +%Y%m%d').trim()
                         def gitShortCommit = sh(returnStdout: true, script: "echo ${env.GIT_COMMIT} | cut -b 1-7 ").trim()
                         version="${env.CHANGE_ID}.${date}.${gitShortCommit}"
-                        sh "apt-get update || true"
-                        sh "apt-get install -y git python3-pip"
-                        sh "apt-get install -y build-essential libopenblas-dev libcurl4-openssl-dev libaio-dev libdouble-conversion-dev libevent-dev libgflags-dev"
+                        sh "bash scripts/install_deps.sh"
+                        sh "apt-get install -y build-essential"
                         sh "git config --global --add safe.directory '*'"
                         sh "git submodule update --recursive --init"
-                        sh "pip3 install conan==1.61.0"
-                        // sh "conan remote add default-conan-local https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local"
                         sh "cmake --version"
                         sh "nvidia-smi --query-gpu=name --format=csv,noheader"
-                        sh "./scripts/prepare_gpu_build.sh"
-                        sh "mkdir build"
-                        sh "cd build/ && conan install .. --build=missing -o with_diskann=True -o with_raft=True -s compiler.libcxx=libstdc++11 && conan build .."
-                        sh "cd python && VERSION=${version} python3 setup.py bdist_wheel"
+                        sh "make WITH_GPU=True"
+                        sh "cd python && VERSION=${version} ./build_portable_wheel.sh"
                         dir('python/dist'){
-                        knowhere_wheel=sh(returnStdout: true, script: 'ls | grep .whl').trim()
+                        knowhere_wheel=sh(returnStdout: true, script: 'ls | grep manylinux.*\\.whl').trim()
                         archiveArtifacts artifacts: "${knowhere_wheel}", followSymlinks: false
                         }
                         // stash knowhere info for rebuild E2E Test only
@@ -67,10 +63,10 @@ pipeline {
                     dir('tests'){
                       unarchive mapping: ["${knowhere_wheel}": "${knowhere_wheel}"]
                       sh "apt-get update || true"
-                      sh "apt-get install -y python3-pip"
-                      sh "apt-get install -y libopenblas-dev libaio-dev libdouble-conversion-dev libevent-dev"
+                      sh "apt-get install -y libopenblas-openmp-dev libaio-dev libdouble-conversion-dev libevent-dev"
                       sh "pip3 install ${knowhere_wheel}"
                       sh "cat requirements.txt | xargs -n 1 pip3 install"
+                      sh "cp -r /home/data/milvus/ann_fbin ."
                       sh "pytest -v"
                     }
                 }
@@ -78,8 +74,8 @@ pipeline {
             post{
                 always {
                     script{
-                        sh 'cp /tmp/knowhere_ci.log knowhere_ci.log'
-                        archiveArtifacts artifacts: 'knowhere_ci.log', followSymlinks: false
+                        sh 'cat tests/pytest.log'
+                        archiveArtifacts artifacts: 'tests/pytest.log', followSymlinks: false
                     }
                 }
             }

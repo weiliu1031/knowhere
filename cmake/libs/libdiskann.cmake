@@ -3,6 +3,9 @@ find_package(Boost REQUIRED COMPONENTS program_options)
 include_directories(${Boost_INCLUDE_DIR})
 find_package(aio REQUIRED)
 include_directories(${AIO_INCLUDE})
+find_package(fmt REQUIRED)
+
+include_directories(${URING_INCLUDE})
 include_directories(thirdparty/DiskANN/include)
 
 find_package(double-conversion REQUIRED)
@@ -17,20 +20,36 @@ set(DISKANN_SOURCES
     thirdparty/DiskANN/src/math_utils.cpp
     thirdparty/DiskANN/src/memory_mapper.cpp
     thirdparty/DiskANN/src/partition_and_pq.cpp
-    thirdparty/DiskANN/src/pq_flash_index.cpp
+    thirdparty/DiskANN/src/ssd_graph_index.cpp
+    thirdparty/DiskANN/src/navigation_runtime.cpp
+    thirdparty/DiskANN/src/pq_navigation.cpp
+    thirdparty/DiskANN/src/rabitq_navigation.cpp
+    thirdparty/DiskANN/src/pq_flash_aisaq_index.cpp
+    thirdparty/DiskANN/src/aisaq_utils.cpp
+    thirdparty/DiskANN/src/aisaq_pq_reader.cpp
     thirdparty/DiskANN/src/logger.cpp
     thirdparty/DiskANN/src/utils.cpp)
 
 find_package(folly REQUIRED)
+set(DISKANN_LINKER_LIBS PUBLIC ${AIO_LIBRARIES} ${DISKANN_BOOST_PROGRAM_OPTIONS_LIB} nlohmann_json::nlohmann_json
+         	Folly::folly fmt::fmt-header-only prometheus-cpp::core prometheus-cpp::push glog::glog)
+if (WITH_CUVS)
+    list(APPEND DISKANN_LINKER_LIBS PRIVATE cuvs::cuvs)
+    list(APPEND DISKANN_SOURCES thirdparty/DiskANN/src/diskann_gpu.cpp)
+endif()
 
 add_library(diskann STATIC ${DISKANN_SOURCES})
+# folly v2026 headers require C++20 (consteval/constinit); DiskANN includes
+# milvus-common's thread_pool.h which pulls in folly/executors.
+set_target_properties(diskann PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 target_link_libraries(
   diskann
-  PUBLIC ${AIO_LIBRARIES}
+  PUBLIC faiss ${AIO_LIBRARIES}
          ${DISKANN_BOOST_PROGRAM_OPTIONS_LIB}
          nlohmann_json::nlohmann_json
+         milvus-common::milvus-common
          Folly::folly
-         fmt::fmt-header-only
+         fmt::fmt
          prometheus-cpp::core
          prometheus-cpp::push
          glog::glog)
@@ -39,4 +58,9 @@ if(__X86_64)
     diskann PRIVATE -fno-builtin-malloc -fno-builtin-calloc
                     -fno-builtin-realloc -fno-builtin-free)
 endif()
-list(APPEND KNOWHERE_LINKER_LIBS diskann)
+
+if (WITH_CUVS)
+    target_link_libraries(diskann PRIVATE cuvs::cuvs)
+endif()
+
+list(APPEND KNOWHERE_PRIVATE_LIBS diskann)

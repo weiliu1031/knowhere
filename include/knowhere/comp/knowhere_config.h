@@ -41,9 +41,11 @@ class KnowhereConfig {
     SetSimdType(const SimdType simd_type);
 
     /**
-     *The purpose of this interface is: part of the sealed indexes default to using bf16 as the base data to achieve
-     *higher capacity; to ensure consistency in computation between growing and sealed, it is necessary to maintain the
-     *same precision in growing calculations as in sealed.
+     * The purpose of this interface is: part of the sealed indexes default to using bf16 as the base data to achieve
+     * higher capacity; to ensure consistency in computation between growing and sealed, it is necessary to maintain the
+     * same precision in growing calculations as in sealed.
+     *
+     * These two functions still remain, just in case, but they do nothing. This is by design.
      */
     static void
     EnablePatchForComputeFP32AsBF16();
@@ -85,6 +87,9 @@ class KnowhereConfig {
     static void
     SetClusteringType(const ClusteringType clustering_type);
 
+    static ClusteringType
+    GetClusteringType();
+
     /**
      * The numebr of maximum parallel disk reads per thread.
      * On Linux, the default limit of `aio-max-nr` is 65536, so the product of `num_threads` and `max_events` (default
@@ -97,9 +102,18 @@ class KnowhereConfig {
 
     static void
     SetBuildThreadPoolSize(size_t num_threads);
+    static size_t
+    GetBuildThreadPoolSize();
 
     static void
     SetSearchThreadPoolSize(size_t num_threads);
+    static size_t
+    GetSearchThreadPoolSize();
+
+    static void
+    SetFetchThreadPoolSize(size_t num_threads);
+    static size_t
+    GetFetchThreadPoolSize();
 
     /**
      * init GPU Resource

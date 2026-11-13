@@ -13,22 +13,120 @@
 #define DATASET_H
 
 #include <any>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 
 #include "comp/index_param.h"
+#include "knowhere/comp/cluster_data.h"
+#include "knowhere/comp/search_hint.h"
+#include "knowhere/range_util.h"
 #include "knowhere/sparse_utils.h"
 
 namespace knowhere {
 
+// Non-owning input view for nullable id-map build/add data.
+class IdMapData {
+ public:
+    // PACKED_BITMAP and BOOL_ARRAY carry public-id validity. IDS carries an
+    // already compact internal-id -> public-id array plus its public-id domain
+    // size.
+    enum class Format {
+        NONE,
+        PACKED_BITMAP,
+        BOOL_ARRAY,
+        IDS,
+    };
+
+    static IdMapData
+    FromValidBitmap(const uint8_t* valid_bitmap, size_t out_count) {
+        return {Format::PACKED_BITMAP, valid_bitmap, nullptr, nullptr, 0, out_count};
+    }
+
+    static IdMapData
+    FromValidData(const bool* valid_data, size_t out_count) {
+        return {Format::BOOL_ARRAY, nullptr, valid_data, nullptr, 0, out_count};
+    }
+
+    static IdMapData
+    FromIds(const int32_t* out_ids, size_t in_count, size_t out_count) {
+        return {Format::IDS, nullptr, nullptr, out_ids, in_count, out_count};
+    }
+
+    bool
+    HasValue() const {
+        return format != Format::NONE;
+    }
+
+    static constexpr const char* DATASET_KEY = "__knowhere_id_map_data";
+
+    Format format = Format::NONE;
+    const uint8_t* valid_bitmap = nullptr;
+    const bool* valid_data = nullptr;
+    const int32_t* out_ids = nullptr;
+    size_t in_count = 0;
+    size_t out_count = 0;
+};
+
 class DataSet : public std::enable_shared_from_this<const DataSet> {
  public:
-    typedef std::variant<const float*, const size_t*, const int64_t*, const void*, int64_t, std::string, std::any> Var;
+    using Var = std::variant<const float*, const size_t*, const int64_t*, const void*, int64_t, std::string, std::any>;
     DataSet() = default;
+    void
+    SetClusterData(ClusterData clusters) {
+        auto owned = std::make_shared<const ClusterData>(std::move(clusters));
+        std::unique_lock lock(mutex_);
+        data_[kClusterDataField] = Var(std::in_place_type<std::any>, std::move(owned));
+    }
+    std::shared_ptr<const ClusterData>
+    GetClusterData() const {
+        std::shared_lock lock(mutex_);
+        auto it = data_.find(kClusterDataField);
+        if (it == data_.end())
+            return nullptr;
+        auto holder = std::get_if<std::any>(&it->second);
+        auto value = std::any_cast<std::shared_ptr<const ClusterData>>(holder);
+        if (!value)
+            throw std::invalid_argument("invalid typed cluster data");
+        return *value;
+    }
+    void
+    ClearClusterData() {
+        std::unique_lock lock(mutex_);
+        data_.erase(kClusterDataField);
+    }
+
+    void
+    SetSearchHints(BatchSearchHints hints) {
+        auto owned = std::make_shared<const BatchSearchHints>(std::move(hints));
+        std::unique_lock lock(mutex_);
+        data_[kSearchHintsField] = Var(std::in_place_type<std::any>, std::move(owned));
+    }
+
+    std::shared_ptr<const BatchSearchHints>
+    GetSearchHints() const {
+        std::shared_lock lock(mutex_);
+        auto it = data_.find(kSearchHintsField);
+        if (it == data_.end())
+            return nullptr;
+        auto holder = std::get_if<std::any>(&it->second);
+        auto hints = std::any_cast<std::shared_ptr<const BatchSearchHints>>(holder);
+        if (hints == nullptr)
+            throw std::invalid_argument("invalid typed search hints");
+        return *hints;
+    }
+
+    void
+    ClearSearchHints() {
+        std::unique_lock lock(mutex_);
+        data_.erase(kSearchHintsField);
+    }
     ~DataSet() {
         if (!is_owner) {
             return;
@@ -57,8 +155,34 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
                 if (ptr != nullptr) {
                     if (is_sparse) {
                         delete[](sparse::SparseRow<float>*)(*ptr);
+                    } else if (is_chunk) {
+                        for (auto i = 0; i < num_chunk; i += 1) {
+                            delete[]((char**)(*ptr))[i];
+                        }
+                        delete[](char**)(*ptr);
                     } else {
                         delete[](char*)(*ptr);
+                    }
+                }
+            }
+            {
+                auto any_ptr = std::get_if<6>(&x.second);
+                if (any_ptr != nullptr) {
+                    try {
+                        auto ptr = std::any_cast<size_t*>(*any_ptr);
+                        if (ptr != nullptr) {
+                            delete[] ptr;
+                        }
+                    } catch (const std::bad_any_cast&) {
+                        try {
+                            // handle knowhere::meta::EMB_LIST_OFFSET (const size_t*)
+                            auto const_ptr = std::any_cast<const size_t*>(*any_ptr);
+                            if (const_ptr != nullptr) {
+                                delete[] const_ptr;
+                            }
+                        } catch (const std::bad_any_cast&) {
+                            // Not a size_t* or const size_t*, ignore
+                        }
                     }
                 }
             }
@@ -72,15 +196,43 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
     }
 
     void
+    SetDistance(std::unique_ptr<float[]>&& dis) {
+        std::unique_lock lock(mutex_);
+        this->data_[meta::DISTANCE] = Var(std::in_place_index<0>, dis.release());
+    }
+
+    void
     SetLims(const size_t* lims) {
         std::unique_lock lock(mutex_);
         this->data_[meta::LIMS] = Var(std::in_place_index<1>, lims);
     }
 
     void
+    SetLims(std::unique_ptr<size_t[]>&& lims) {
+        std::unique_lock lock(mutex_);
+        this->data_[meta::LIMS] = Var(std::in_place_index<1>, lims.release());
+    }
+
+    void
     SetIds(const int64_t* ids) {
         std::unique_lock lock(mutex_);
         this->data_[meta::IDS] = Var(std::in_place_index<2>, ids);
+    }
+
+    void
+    SetIds(std::unique_ptr<long int[]>&& ids) {
+        static_assert(sizeof(long int) == sizeof(int64_t));
+
+        std::unique_lock lock(mutex_);
+        this->data_[meta::IDS] = Var(std::in_place_index<2>, reinterpret_cast<int64_t*>(ids.release()));
+    }
+
+    void
+    SetIds(std::unique_ptr<long long int[]>&& ids) {
+        static_assert(sizeof(long long int) == sizeof(int64_t));
+
+        std::unique_lock lock(mutex_);
+        this->data_[meta::IDS] = Var(std::in_place_index<2>, reinterpret_cast<int64_t*>(ids.release()));
     }
 
     /**
@@ -92,6 +244,13 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
     SetTensor(const void* tensor) {
         std::unique_lock lock(mutex_);
         this->data_[meta::TENSOR] = Var(std::in_place_index<3>, tensor);
+    }
+
+    template <typename T>
+    void
+    SetTensor(std::unique_ptr<T[]>&& tensor) {
+        std::unique_lock lock(mutex_);
+        this->data_[meta::TENSOR] = Var(std::in_place_index<3>, tensor.release());
     }
 
     void
@@ -107,6 +266,12 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
     }
 
     void
+    SetTensorBeginId(const int64_t offset) {
+        std::unique_lock lock(mutex_);
+        this->data_[meta::INPUT_BEG_ID] = Var(std::in_place_index<4>, offset);
+    }
+
+    void
     SetJsonInfo(const std::string& info) {
         std::unique_lock lock(mutex_);
         this->data_[meta::JSON_INFO] = Var(std::in_place_index<5>, info);
@@ -116,6 +281,53 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
     SetJsonIdSet(const std::string& idset) {
         std::unique_lock lock(mutex_);
         this->data_[meta::JSON_ID_SET] = Var(std::in_place_index<5>, idset);
+    }
+
+    void
+    SetIdMapData(const IdMapData& id_map_data) {
+        // The pointed-to buffers must outlive the Build/Add call.
+        std::unique_lock lock(mutex_);
+        this->data_[IdMapData::DATASET_KEY] = Var(std::in_place_type<std::any>, id_map_data);
+    }
+
+    IdMapData
+    GetIdMapData() const {
+        std::shared_lock lock(mutex_);
+        auto it = this->data_.find(IdMapData::DATASET_KEY);
+        if (it == this->data_.end()) {
+            return {};
+        }
+
+        auto any_ptr = std::get_if<std::any>(&it->second);
+        if (any_ptr == nullptr) {
+            return {};
+        }
+
+        auto id_map_data = std::any_cast<IdMapData>(any_ptr);
+        return id_map_data == nullptr ? IdMapData{} : *id_map_data;
+    }
+
+    bool
+    HasIdMapData() const {
+        std::shared_lock lock(mutex_);
+        auto it = this->data_.find(IdMapData::DATASET_KEY);
+        if (it == this->data_.end()) {
+            return false;
+        }
+
+        auto any_ptr = std::get_if<std::any>(&it->second);
+        if (any_ptr == nullptr) {
+            return false;
+        }
+
+        auto id_map_data = std::any_cast<IdMapData>(any_ptr);
+        return id_map_data != nullptr && id_map_data->HasValue();
+    }
+
+    void
+    ClearIdMapData() {
+        std::unique_lock lock(mutex_);
+        this->data_.erase(IdMapData::DATASET_KEY);
     }
 
     const float*
@@ -213,7 +425,7 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
     }
 
     bool
-    GetIsSparse() {
+    GetIsSparse() const {
         std::unique_lock lock(mutex_);
         return this->is_sparse;
     }
@@ -222,6 +434,41 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
     SetIsSparse(bool is_sparse) {
         std::unique_lock lock(mutex_);
         this->is_sparse = is_sparse;
+    }
+
+    bool
+    GetIsChunk() const {
+        std::unique_lock lock(mutex_);
+        return this->is_chunk;
+    }
+
+    void
+    SetIsChunk(bool is_chunk) {
+        std::unique_lock lock(mutex_);
+        this->is_chunk = is_chunk;
+    }
+
+    int64_t
+    GetNumChunk() const {
+        std::unique_lock lock(mutex_);
+        return this->num_chunk;
+    }
+
+    void
+    SetNumChunk(int64_t num_chunk) {
+        std::unique_lock lock(mutex_);
+        this->num_chunk = num_chunk;
+    }
+
+    int64_t
+    GetTensorBeginId() const {
+        std::shared_lock lock(mutex_);
+        auto it = this->data_.find(meta::INPUT_BEG_ID);
+        if (it != this->data_.end()) {
+            int64_t res = *std::get_if<4>(&it->second);
+            return res;
+        }
+        return 0;
     }
 
     // deprecated API
@@ -234,7 +481,7 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
 
     template <typename T>
     T
-    Get(const std::string& k) {
+    Get(const std::string& k) const {
         std::shared_lock lock(mutex_);
         auto it = this->data_.find(k);
         if (it != this->data_.end()) {
@@ -248,15 +495,19 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
     std::map<std::string, Var> data_;
     bool is_owner = true;
     bool is_sparse = false;
+    bool is_chunk = false;
+    int64_t num_chunk = 1;
 };
 using DataSetPtr = std::shared_ptr<DataSet>;
+
 inline DataSetPtr
-GenDataSet(const int64_t nb, const int64_t dim, const void* xb) {
+GenDataSet(const int64_t nb, const int64_t dim, const void* xb, const int64_t beg_id = 0) {
     auto ret_ds = std::make_shared<DataSet>();
     ret_ds->SetRows(nb);
     ret_ds->SetDim(dim);
     ret_ds->SetTensor(xb);
     ret_ds->SetIsOwner(false);
+    ret_ds->SetTensorBeginId(beg_id);
     return ret_ds;
 }
 
@@ -284,17 +535,58 @@ GenResultDataSet(const int64_t rows, const int64_t dim, const void* tensor) {
     return ret_ds;
 }
 
+template <typename T>
+inline DataSetPtr
+GenResultDataSet(const int64_t rows, const int64_t dim, std::unique_ptr<T[]>&& tensor) {
+    auto ret_ds = std::make_shared<DataSet>();
+    ret_ds->SetRows(rows);
+    ret_ds->SetDim(dim);
+    ret_ds->SetTensor(std::move(tensor));
+    ret_ds->SetIsOwner(true);
+    return ret_ds;
+}
+
 inline DataSetPtr
 #ifdef NOT_COMPILE_FOR_SWIG
 GenResultDataSet(const int64_t nq, const int64_t topk, const int64_t* ids, const float* distance) {
 #else
 GenResultDataSet(const int64_t nq, const int64_t topk, const void* ids, const float* distance) {
 #endif
+    static_assert(sizeof(int64_t) == sizeof(long long int));
+
     auto ret_ds = std::make_shared<DataSet>();
     ret_ds->SetRows(nq);
     ret_ds->SetDim(topk);
     ret_ds->SetIds((const int64_t*)ids);
     ret_ds->SetDistance(distance);
+    ret_ds->SetIsOwner(true);
+    return ret_ds;
+}
+
+inline DataSetPtr
+GenResultDataSet(const int64_t nq, const int64_t topk, std::unique_ptr<long int[]>&& ids,
+                 std::unique_ptr<float[]>&& distance) {
+    static_assert(sizeof(int64_t) == sizeof(long int));
+
+    auto ret_ds = std::make_shared<DataSet>();
+    ret_ds->SetRows(nq);
+    ret_ds->SetDim(topk);
+    ret_ds->SetIds(std::move(ids));
+    ret_ds->SetDistance(std::move(distance));
+    ret_ds->SetIsOwner(true);
+    return ret_ds;
+}
+
+inline DataSetPtr
+GenResultDataSet(const int64_t nq, const int64_t topk, std::unique_ptr<long long int[]>&& ids,
+                 std::unique_ptr<float[]>&& distance) {
+    static_assert(sizeof(int64_t) == sizeof(long long int));
+
+    auto ret_ds = std::make_shared<DataSet>();
+    ret_ds->SetRows(nq);
+    ret_ds->SetDim(topk);
+    ret_ds->SetIds(std::move(ids));
+    ret_ds->SetDistance(std::move(distance));
     ret_ds->SetIsOwner(true);
     return ret_ds;
 }
@@ -310,6 +602,17 @@ GenResultDataSet(const int64_t nq, const void* ids, const float* distance, const
     ret_ds->SetIds((const int64_t*)ids);
     ret_ds->SetDistance(distance);
     ret_ds->SetLims((const size_t*)lims);
+    ret_ds->SetIsOwner(true);
+    return ret_ds;
+}
+
+inline DataSetPtr
+GenResultDataSet(const int64_t nq, RangeSearchResult&& range_search_result) {
+    auto ret_ds = std::make_shared<DataSet>();
+    ret_ds->SetRows(nq);
+    ret_ds->SetIds(std::move(range_search_result.labels));
+    ret_ds->SetDistance(std::move(range_search_result.distances));
+    ret_ds->SetLims(std::move(range_search_result.lims));
     ret_ds->SetIsOwner(true);
     return ret_ds;
 }
